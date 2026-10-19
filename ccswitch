@@ -28,6 +28,8 @@ LIVE_SERVICE = "Claude Code-credentials"   # the item Claude Code reads and writ
 SLOT_SERVICE = "ccswitch"                  # our slots: one item per account email
 SLOT_FORMAT = 1
 STDIN_LIMIT = 4096                         # `security -i` line limit; argv above it, like Claude Code
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,}$")
+ACCOUNT_RE = re.compile(r"^[A-Za-z0-9._%+@-]{1,320}$")   # what may become a Keychain account name
 
 
 class Fail(Exception):
@@ -67,8 +69,26 @@ def _run(args: list[str], *, input_text: str | None = None, timeout: int = 30) -
     return subprocess.run(args, input=input_text, capture_output=True, text=True, timeout=timeout)
 
 
+def _check_account(account: str) -> str:
+    """Refuse anything that could not be a Keychain account name we wrote: the value
+    is interpolated into a `security -i` line, so quotes and control characters
+    must never reach it."""
+    if not ACCOUNT_RE.match(account):
+        raise Fail("refusing an account name with characters outside [A-Za-z0-9._%+@-]")
+    return account
+
+
+def check_email(email: str) -> str:
+    email = email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise Fail(f"'{email}' is not an email address")
+    return email
+
+
 def kc_read(service: str, account: str | None = None) -> str | None:
     """The password of a generic item, or None when there is no such item."""
+    if account is not None:
+        _check_account(account)
     args = [security_bin(), "find-generic-password", "-s", service]
     if account:
         args += ["-a", account]
@@ -94,6 +114,7 @@ def kc_write(service: str, account: str, secret: str) -> None:
     """Create or update an item. The secret goes over stdin (`security -i`) so it
     never shows in `ps`; above the stdin line limit it goes as hex argv, which is
     what Claude Code itself does."""
+    _check_account(account)
     hexed = secret.encode("utf-8").hex()
     line = f'add-generic-password -U -a "{account}" -s "{service}" -X {hexed}\n'
     if len(line) <= STDIN_LIMIT:
@@ -105,6 +126,7 @@ def kc_write(service: str, account: str, secret: str) -> None:
 
 
 def kc_delete(service: str, account: str) -> bool:
+    _check_account(account)
     p = _run([security_bin(), "delete-generic-password", "-a", account, "-s", service])
     return p.returncode == 0
 
@@ -209,7 +231,7 @@ def load_index() -> dict:
         d = json.loads(p.read_text())
     except ValueError:
         raise Fail(f"{p} is not valid JSON")
-    d.setdefault("slots", {})
+    d["slots"] = {e: m for e, m in (d.get("slots") or {}).items() if EMAIL_RE.match(e)}
     return d
 
 
@@ -322,9 +344,10 @@ def do_save(as_email: str | None, quiet: bool = False) -> str:
         raise Fail(f"the live login cannot be saved: {dead}. Log in again:\n" + fallback_line(as_email or current_email() or "<addr>"))
     cfg = load_config()
     status = auth_status()
-    email = (as_email or status.get("email") or current_email(cfg) or "").lower()
-    if not email or "@" not in email:
+    email = (as_email or status.get("email") or current_email(cfg) or "").strip().lower()
+    if not email:
         raise Fail("could not tell which account is logged in; pass --as <email>")
+    email = check_email(email)
     slot = {
         "format": SLOT_FORMAT,
         "email": email,
@@ -491,6 +514,7 @@ def do_status() -> int:
 
 
 def do_login(email: str) -> int:
+    email = check_email(email)
     say(f"running the real login for {email}; finish it in the browser, then the slot is saved.")
     p = subprocess.run([claude_bin(), "auth", "login", "--email", email])
     if p.returncode != 0:

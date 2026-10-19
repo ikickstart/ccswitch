@@ -193,6 +193,25 @@ class Switch(Base):
         self.assertIn("x  slot a@x.com", p.stdout.replace("x slot", "x  slot"))
 
 
+class Inputs(Base):
+    def test_an_email_that_could_break_the_security_command_line_is_refused(self):
+        for bad in ('x"@y.com', 'a b@y.com', 'a@y.com; rm -rf /', "a'@y.com", "not-an-email"):
+            p = self.cc("save", "--as", bad)
+            self.assertEqual(p.returncode, 2, bad)
+            self.assertNotIn("ccswitch", self.keychain(), bad)
+        self.assertEqual(self.cc("login", 'x"@y.com').returncode, 2)
+
+    def test_a_hand_edited_index_entry_that_is_not_an_email_never_reaches_the_keychain(self):
+        self.assertEqual(self.cc("save").returncode, 0)
+        idx_path = self.home / "ccswitch" / "slots.json"
+        idx = json.loads(idx_path.read_text())
+        idx["slots"]['evil"; -s x'] = {"saved_at": "2026-01-01T00:00:00+00:00"}
+        idx_path.write_text(json.dumps(idx))
+        p = self.cc("evil", "-y")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("no slot matches", p.stderr)
+
+
 class ConfigDir(Base):
     def test_claude_config_dir_moves_the_json_inside_it(self):
         cdir = self.home / "alt"

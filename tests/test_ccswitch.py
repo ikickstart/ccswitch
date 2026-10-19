@@ -27,6 +27,9 @@ class Base(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(home), "FAKE_KEYCHAIN": str(self.kc),
                     "CCSWITCH_HOME": str(home / "ccswitch"), "PATH": f"{FAKEBIN}:{os.environ['PATH']}"}
         self.env.pop("CLAUDE_CONFIG_DIR", None)
+        for k in [k for k in self.env if k.startswith("CMUX_") or k.startswith("CCSWITCH_")]:
+            self.env.pop(k)
+        self.env["CCSWITCH_HOME"] = str(home / "ccswitch")
         self.keychain({LIVE: {"tester": json.dumps(oauth("a@x.com"))}})
         self.config({"oauthAccount": {"emailAddress": "a@x.com", "organizationName": "A org"},
                      "numStartups": 3, "mcpServers": {"m": {}},
@@ -224,3 +227,191 @@ class ConfigDir(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Tee(Base):
+    def feed(self, **over):
+        d = {"session_id": "sess-1", "transcript_path": str(self.home / "t.jsonl"), "cwd": "/x",
+             "model": {"id": "claude-fable-5-1"}, "context_window": {"used_percentage": 42.5},
+             "rate_limits": {"five_hour": {"used_percentage": 61, "resets_at": 4102444800},
+                             "seven_day": {"used_percentage": 20, "resets_at": 4102444800}}}
+        d.update(over)
+        return json.dumps(d)
+
+    def test_tee_records_the_feed_and_passes_the_original_command_through(self):
+        (self.home / "ccswitch").mkdir(parents=True, exist_ok=True)
+        (self.home / "ccswitch" / "statusline.json").write_text(json.dumps({"command": "sed 's/^/HUD:/' | head -c 20"}))
+        env = {**self.env, "CMUX_SURFACE_ID": "SURF-1", "CMUX_WORKSPACE_ID": "WS-1"}
+        p = subprocess.run([sys.executable, str(SCRIPT), "statusline-tee"], env=env, input=self.feed(), capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertTrue(p.stdout.startswith("HUD:{"), p.stdout)
+        rec = json.loads((self.home / "ccswitch" / "sessions" / "sess-1.json").read_text())
+        self.assertEqual(rec["context_pct"], 42.5)
+        self.assertEqual(rec["five_hour"]["used_percentage"], 61)
+        self.assertEqual(rec["cmux"], {"surface": "SURF-1", "workspace": "WS-1"})
+        self.assertEqual(rec["cwd"], "/x")
+
+    def test_tee_survives_garbage_and_still_runs_the_original(self):
+        (self.home / "ccswitch").mkdir(parents=True, exist_ok=True)
+        (self.home / "ccswitch" / "statusline.json").write_text(json.dumps({"command": "echo HUD"}))
+        p = subprocess.run([sys.executable, str(SCRIPT), "statusline-tee"], env=self.env, input="not json", capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(p.stdout.strip(), "HUD")
+
+
+class Watch(Base):
+    """Three slots a, b, c; b is live. The feed says b is at 95%."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.cc("save").returncode, 0)               # a (its usage snapshot: 5h 90%)
+        self.login("c@x.com"); self.assertEqual(self.cc("save").returncode, 0)   # c (5h 7%)
+        self.login("b@x.com"); self.assertEqual(self.cc("save").returncode, 0)   # b, live
+        self.cmux_log = self.home / "cmux.log"; self.cmux_log.write_text("")
+        self.transcripts = self.home / "transcripts"; self.transcripts.mkdir()
+        self.env.update({"FAKE_CMUX_LOG": str(self.cmux_log), "FAKE_CMUX_TRANSCRIPTS": str(self.transcripts),
+                         "CCSWITCH_NO_NOTIFY": "1"})
+        (self.home / ".claude").mkdir(exist_ok=True)
+
+    def session(self, sid, surface, five_hour=95, ctx=30, age=0):
+        t = self.transcripts / f"{surface}.jsonl"
+        t.touch()
+        d = {"session_id": sid, "ts": int(time.time()) - age, "pid": 1, "cwd": "/x", "transcript_path": str(t),
+             "context_pct": ctx, "five_hour": {"used_percentage": five_hour, "resets_at": 4102444800},
+             "seven_day": {"used_percentage": 10, "resets_at": 4102444800},
+             "cmux": {"surface": surface, "workspace": "WS"}}
+        sd = self.home / "ccswitch" / "sessions"; sd.mkdir(parents=True, exist_ok=True)
+        (sd / f"{sid}.json").write_text(json.dumps(d))
+
+    def cmux_calls(self):
+        return [json.loads(l) for l in self.cmux_log.read_text().splitlines()]
+
+    def state(self):
+        return json.loads((self.home / "ccswitch" / "watch-state.json").read_text())
+
+    def test_below_the_threshold_nothing_happens(self):
+        self.session("s1", "S1", five_hour=50)
+        p = self.cc("watch", "--once", "--switch-at", "90", "-v")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
+        self.assertEqual(self.cmux_calls(), [])
+
+    def test_over_the_threshold_every_session_is_compacted_then_the_account_with_most_headroom_is_loaded(self):
+        self.session("s1", "S1", five_hour=95); self.session("s2", "S2", five_hour=95)
+        p = self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "native,cmux", "--compact-timeout", "5")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        calls = self.cmux_calls()
+        sends = [c for c in calls if c[0] == "send"]
+        enters = [c for c in calls if c[0] == "send-key"]
+        self.assertEqual(sorted(c[c.index("--surface") + 1] for c in sends), ["S1", "S2"])
+        self.assertEqual(len(enters), 2)
+        self.assertTrue(all(c[-1] == "/compact" for c in sends))
+        self.assertIn("compact_boundary", (self.transcripts / "S1.jsonl").read_text())
+        # c had 7% in its snapshot, a had 90%: c wins
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "c@x.com")
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"].startswith("rt-c@x.com"), True)
+        st = self.state()
+        self.assertGreater(st["last_switch_at"], 0)
+        self.assertGreater(st["ignore_before"], st["last_switch_at"])
+        self.assertIn("switched b@x.com -> c@x.com", p.stderr)
+        # the outgoing account's usage was written to its slot from the feed
+        self.assertEqual(self.index()["slots"]["b@x.com"]["usage"]["five_hour"]["utilization"], 95)
+
+    def test_within_the_cooldown_no_second_switch(self):
+        self.session("s1", "S1", five_hour=95)
+        self.assertEqual(self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux").returncode, 0)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "c@x.com")
+        self.session("s1", "S1", five_hour=95)       # fresh sample, still says 95
+        self.assertEqual(self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux").returncode, 0)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "c@x.com")
+
+    def test_when_every_slot_is_over_the_threshold_nothing_is_switched(self):
+        idx_path = self.home / "ccswitch" / "slots.json"
+        idx = json.loads(idx_path.read_text())
+        for e in idx["slots"]:
+            idx["slots"][e]["usage"] = {"five_hour": {"utilization": 99, "resets_at": "2999-01-01T00:00:00+00:00"}}
+        idx_path.write_text(json.dumps(idx))
+        self.session("s1", "S1", five_hour=95)
+        p = self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux")
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("candidates: none", p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
+        self.assertEqual(self.cmux_calls(), [], "no compaction when there is nothing to switch to")
+
+    def test_a_slot_whose_window_has_reset_counts_as_empty(self):
+        idx_path = self.home / "ccswitch" / "slots.json"
+        idx = json.loads(idx_path.read_text())
+        idx["slots"]["a@x.com"]["usage"] = {"five_hour": {"utilization": 99, "resets_at": "2000-01-01T00:00:00+00:00"}}
+        idx["slots"]["c@x.com"]["usage"] = {"five_hour": {"utilization": 40, "resets_at": "2999-01-01T00:00:00+00:00"}}
+        idx_path.write_text(json.dumps(idx))
+        self.session("s1", "S1", five_hour=95)
+        self.assertEqual(self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux").returncode, 0)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+
+    def test_a_dead_candidate_is_skipped_for_the_next_one(self):
+        idx_path = self.home / "ccswitch" / "slots.json"
+        idx = json.loads(idx_path.read_text())
+        idx["slots"]["a@x.com"]["usage"] = {"five_hour": {"utilization": 50, "resets_at": "2999-01-01T00:00:00+00:00"}}
+        idx_path.write_text(json.dumps(idx))
+        kc = self.keychain()
+        slot = json.loads(kc["ccswitch"]["c@x.com"]); slot["credentials"]["claudeAiOauth"]["refreshToken"] = ""
+        kc["ccswitch"]["c@x.com"] = json.dumps(slot); self.keychain(kc)
+        self.session("s1", "S1", five_hour=95)
+        p = self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux")
+        self.assertEqual(p.returncode, 0)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+        self.assertIn("trying the next candidate", p.stderr)
+
+    def test_cmux_refusal_is_logged_and_the_switch_still_happens(self):
+        self.session("s1", "S1", five_hour=95)
+        self.env["FAKE_CMUX_REFUSE"] = "1"
+        p = self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux", "--compact-timeout", "1")
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("cmux refused", p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "c@x.com")
+
+    def test_context_threshold_compacts_a_full_session_once_per_cooldown(self):
+        self.session("s1", "S1", five_hour=10, ctx=85); self.session("s2", "S2", five_hour=10, ctx=40)
+        self.assertEqual(self.cc("watch", "--once", "--compact-at", "80", "--compact-via", "cmux").returncode, 0)
+        sends = [c for c in self.cmux_calls() if c[0] == "send"]
+        self.assertEqual([c[c.index("--surface") + 1] for c in sends], ["S1"])
+        self.session("s1", "S1", five_hour=10, ctx=85)
+        self.assertEqual(self.cc("watch", "--once", "--compact-at", "80", "--compact-via", "cmux").returncode, 0)
+        self.assertEqual(len([c for c in self.cmux_calls() if c[0] == "send"]), 1, "cooldown")
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
+
+    def test_a_custom_compaction_command_gets_the_session_json(self):
+        out = self.home / "custom.txt"
+        self.session("s1", "S1", five_hour=10, ctx=85)
+        p = self.cc("watch", "--once", "--compact-at", "80", "--compact-via", f"cmd:cat > {out}")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(out.read_text())["session_id"], "s1")
+
+    def test_native_threshold_lands_in_the_settings_env_and_is_removed_on_uninstall(self):
+        sp = self.home / ".claude" / "settings.json"
+        sp.write_text(json.dumps({"statusLine": {"type": "command", "command": "node hud.mjs", "refreshInterval": 10}, "model": "x"}))
+        p = self.cc("daemon", "install", "--switch-at", "85", "--compact-at", "80", "--no-launchd")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = json.loads(sp.read_text())
+        self.assertEqual(d["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "80")
+        self.assertEqual(d["model"], "x")
+        self.assertIn("statusline-tee", d["statusLine"]["command"])
+        self.assertEqual(json.loads((self.home / "ccswitch" / "statusline.json").read_text())["command"], "node hud.mjs")
+        plist = (self.home / "Library" / "LaunchAgents" / "com.ccswitch.watch.plist").read_text()
+        self.assertIn("<string>--switch-at</string>", plist)
+        self.assertIn("<string>85</string>", plist)
+        self.assertIn("<string>--compact-at</string>", plist)
+        p = self.cc("daemon", "uninstall", "--no-launchd")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = json.loads(sp.read_text())
+        self.assertNotIn("env", d)
+        self.assertEqual(d["statusLine"]["command"], "node hud.mjs")
+        self.assertFalse((self.home / "Library" / "LaunchAgents" / "com.ccswitch.watch.plist").exists())
+
+    def test_dry_run_changes_nothing(self):
+        self.session("s1", "S1", five_hour=95)
+        p = self.cc("watch", "--once", "--switch-at", "90", "--compact-at", "20", "--dry-run")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("would switch b@x.com -> c@x.com", p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
+        self.assertEqual(self.cmux_calls(), [])

@@ -73,6 +73,7 @@ ccswitch second             # switch; an unambiguous prefix is enough
 ccswitch second -y          # without the question
 ccswitch second --probe     # also send one tiny request to prove the token works
 ccswitch doctor             # check the live item, the index and every slot
+ccswitch daemon install --switch-at 90 --compact-at 80   # see below
 ccswitch remove old@x.com   # forget a slot (the account itself is untouched)
 ```
 
@@ -82,6 +83,58 @@ limit, switch from any shell. Sessions already open pick the new account up
 within half a minute. `ccswitch list` shows the usage each slot had when it was
 last saved, so you can pick the one with headroom; a window past its reset time
 shows as empty.
+
+## The daemon: switch and compact automatically
+
+```sh
+ccswitch daemon install --switch-at 90 --compact-at 80
+ccswitch daemon status
+ccswitch daemon log
+ccswitch daemon uninstall
+```
+
+`install` does three things and `uninstall` undoes all of them:
+
+1. **Puts a tee in front of your status line.** Claude Code hands its status-line
+   command, every ten seconds per session, the five-hour and weekly usage, the
+   context percentage, the session id and the transcript path. The tee records
+   that to `~/.config/ccswitch/sessions/` and runs your original command
+   unchanged (claude-hud keeps working). No token, no API call: the feed is what
+   Claude Code already computes.
+2. **Sets Claude Code's own compaction threshold.** `--compact-at 80` writes
+   `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` into the `env` block of your settings, so
+   every session started afterwards compacts itself at 80% context.
+3. **Registers `ccswitch watch` with launchd**, started at login, restarted if it
+   dies, logging to `~/Library/Logs/ccswitch.log`.
+
+The loop, every 15 seconds:
+
+- A session whose context is at or above `--compact-at` is asked to compact
+  through the runtime methods in `--compact-via` (default `native,cmux`):
+  `cmux` types `/compact` into that session's cmux pane (the pane is known
+  because the tee records the session's `CMUX_SURFACE_ID`), and `cmd:<command>`
+  runs your own command with the session's JSON on stdin, for any other
+  terminal. Each session is compacted at most once per `--compact-cooldown`.
+  cmux refuses to type into a pane where you are mid-sentence or a dialog is
+  open; `--force` overrides that.
+- When the five-hour window reaches `--switch-at` (or the weekly window reaches
+  `--weekly-at`, if given), the daemon compacts every live session, waits until
+  each transcript records the compaction (or `--compact-timeout` passes), then
+  loads the saved account with the most headroom: lowest known five-hour usage,
+  a window past its reset counting as empty, dead slots skipped for the next
+  candidate. A macOS notification names both accounts. Open sessions follow
+  within half a minute. `--cooldown` (default 300s) stops it flapping.
+- If every saved account is at or above the threshold it notifies and waits.
+
+`ccswitch watch --once --dry-run -v` shows what the loop would do right now
+without changing anything. Thresholds and methods are given at install time
+and live in the launchd plist; re-run `install` to change them.
+
+**What a switch does to a running session: nothing.** The account is a Keychain
+item each session re-reads on its next request. Context, transcript and running
+subagents are untouched. The compaction before a switch is a choice, not a
+necessity: it keeps every session small at the moment it moves to the other
+account's window.
 
 ## Rules
 

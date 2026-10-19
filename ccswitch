@@ -258,6 +258,7 @@ def usage_summary(cu: dict | None) -> dict:
             out[k] = {"utilization": w.get("utilization"), "resets_at": w.get("resets_at")}
     if cu.get("fetchedAtMs"):
         out["fetched_at"] = iso(cu["fetchedAtMs"])
+        out["fetched_at_ms"] = int(cu["fetchedAtMs"])
     return out
 
 
@@ -359,11 +360,15 @@ def do_save(as_email: str | None, quiet: bool = False) -> str:
     }
     slot_write(email, slot)
     index = load_index()
+    usage = usage_summary(cfg.get("cachedUsageUtilization"))
+    prior = (index["slots"].get(email) or {}).get("usage") or {}
+    if prior.get("fetched_at_ms", 0) > usage.get("fetched_at_ms", 0):
+        usage = prior          # the daemon's feed is fresher than Claude Code's cached snapshot
     index["slots"][email] = {
         "saved_at": slot["saved_at"],
         "org": status.get("orgName") or (cfg.get("oauthAccount") or {}).get("organizationName"),
         "plan": status.get("subscriptionType") or live["claudeAiOauth"].get("subscriptionType"),
-        "usage": usage_summary(cfg.get("cachedUsageUtilization")),
+        "usage": usage,
         "refresh_expires_at": iso(live["claudeAiOauth"].get("refreshTokenExpiresAt")),
     }
     save_index(index)
@@ -576,6 +581,552 @@ def do_doctor() -> int:
     return 1 if problems else 0
 
 
+# ----------------------------------------------------------------------------- watch: the feed
+
+def sessions_dir() -> Path:
+    return index_path().parent / "sessions"
+
+
+def statusline_record() -> Path:
+    """Where the original status-line command is kept while the tee is installed."""
+    return index_path().parent / "statusline.json"
+
+
+def settings_path() -> Path:
+    return config_dir() / "settings.json"
+
+
+def do_statusline_tee() -> int:
+    """Runs as the status-line command, every ~10s per session. Records the feed
+    Claude Code hands it to sessions/<id>.json, then runs the original command
+    with the same stdin. Must never break the status line: every failure is
+    swallowed and the original still runs."""
+    raw = sys.stdin.read()
+    try:
+        d = json.loads(raw) if raw.strip() else {}
+        sid = d.get("session_id")
+        if isinstance(sid, str) and re.match(r"^[A-Za-z0-9-]{1,80}$", sid):
+            rl = d.get("rate_limits") or {}
+            cw = d.get("context_window") or {}
+            rec = {
+                "session_id": sid,
+                "ts": int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                "pid": os.getppid(),
+                "cwd": d.get("cwd"),
+                "transcript_path": d.get("transcript_path"),
+                "model": (d.get("model") or {}).get("id"),
+                "context_pct": cw.get("used_percentage"),
+                "five_hour": rl.get("five_hour") or None,
+                "seven_day": rl.get("seven_day") or None,
+                "cmux": {k: os.environ.get(v) for k, v in (
+                    ("surface", "CMUX_SURFACE_ID"), ("workspace", "CMUX_WORKSPACE_ID"),
+                    ("window", "CMUX_WINDOW_ID"), ("claude_pid", "CMUX_CLAUDE_PID")) if os.environ.get(v)},
+                "tmux_pane": os.environ.get("TMUX_PANE"),
+            }
+            sd = sessions_dir()
+            sd.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=sid + ".", dir=sd)
+            with os.fdopen(fd, "w") as f:
+                json.dump(rec, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, sd / f"{sid}.json")
+    except Exception:
+        pass
+    try:
+        orig = json.loads(statusline_record().read_text()).get("command")
+    except Exception:
+        orig = None
+    if orig:
+        try:
+            p = subprocess.run(orig, shell=True, input=raw, capture_output=True, text=True, timeout=20)
+            sys.stdout.write(p.stdout)
+            sys.stdout.flush()
+            return 0
+        except Exception:
+            return 0
+    return 0
+
+
+def live_sessions(max_age: int = 90) -> list[dict]:
+    """Every session whose feed was updated within `max_age` seconds."""
+    out = []
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    sd = sessions_dir()
+    if not sd.exists():
+        return out
+    for f in sd.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if now - int(d.get("ts") or 0) <= max_age:
+            out.append(d)
+        elif now - int(d.get("ts") or 0) > 7 * 86400:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    return sorted(out, key=lambda d: d.get("ts") or 0, reverse=True)
+
+
+def current_usage(sessions: list[dict], since: int = 0) -> tuple[float | None, dict | None]:
+    """The freshest five-hour percentage reported after `since`, with its window."""
+    for s in sessions:
+        if (s.get("ts") or 0) < since:
+            continue
+        w = s.get("five_hour") or {}
+        pct = w.get("used_percentage")
+        if isinstance(pct, (int, float)):
+            return float(pct), w
+    return None, None
+
+
+# ----------------------------------------------------------------------------- watch: compaction
+
+def compact_methods(spec: str) -> list[str]:
+    methods = [m.strip() for m in spec.split(",") if m.strip()]
+    for m in methods:
+        if m not in ("native", "cmux") and not m.startswith("cmd:"):
+            raise Fail(f"unknown compaction method '{m}': use native, cmux or cmd:<command>")
+    return methods
+
+
+def apply_native_threshold(pct: int | None) -> bool:
+    """Set (or clear, with None) CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the settings env
+    block, so every session started afterwards compacts itself at `pct`. Returns
+    whether the file changed."""
+    sp = settings_path()
+    try:
+        d = json.loads(sp.read_text()) if sp.exists() else {}
+    except ValueError:
+        raise Fail(f"{sp} is not valid JSON; not touching it")
+    env = d.get("env") if isinstance(d.get("env"), dict) else {}
+    before = env.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+    if pct is None:
+        env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
+    else:
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(int(pct))
+    if (env.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")) == before:
+        return False
+    if env:
+        d["env"] = env
+    else:
+        d.pop("env", None)
+    _write_json_atomic(sp, d)
+    return True
+
+
+def _write_json_atomic(p: Path, d: dict) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=p.name + ".", dir=p.parent)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    if p.exists():
+        os.chmod(tmp, p.stat().st_mode & 0o777)
+    os.replace(tmp, p)
+
+
+def compact_boundaries(transcript: str | None) -> int:
+    """How many compactions the transcript records so far."""
+    if not transcript or not os.path.exists(transcript):
+        return -1
+    n = 0
+    try:
+        with open(transcript, "rb") as f:
+            for line in f:
+                if b'"compact_boundary"' in line:
+                    n += 1
+    except OSError:
+        return -1
+    return n
+
+
+def cmux_bin() -> str:
+    return os.environ.get("CCSWITCH_CMUX") or shutil.which("cmux") or "/Applications/cmux.app/Contents/Resources/bin/cmux"
+
+
+def send_compact(session: dict, methods: list[str], force: bool, log) -> bool:
+    """Ask one running session to compact, through every runtime method. Returns
+    whether any method was actually delivered."""
+    sent = False
+    for m in methods:
+        if m == "native":
+            continue  # install-time: the session compacts itself
+        if m == "cmux":
+            c = session.get("cmux") or {}
+            if not c.get("surface"):
+                log(f"  {session['session_id'][:8]}: no cmux surface recorded; skipping cmux")
+                continue
+            target = ["--surface", c["surface"]] + (["--workspace", c["workspace"]] if c.get("workspace") else [])
+            extra = ["--force"] if force else []
+            p = _run([cmux_bin(), "send", *target, *extra, "--", "/compact"], timeout=20)
+            if p.returncode == 0:
+                import time as _t
+                _t.sleep(0.5)
+                p = _run([cmux_bin(), "send-key", *target, *extra, "--", "Enter"], timeout=20)
+            if p.returncode != 0:
+                log(f"  {session['session_id'][:8]}: cmux refused ({(p.stderr or p.stdout).strip()[:120]})")
+                continue
+            sent = True
+        elif m.startswith("cmd:"):
+            p = subprocess.run(m[4:], shell=True, input=json.dumps(session), capture_output=True, text=True, timeout=60)
+            if p.returncode != 0:
+                log(f"  {session['session_id'][:8]}: compaction command exited {p.returncode}")
+                continue
+            sent = True
+    return sent
+
+
+def wait_compacted(session: dict, before_boundaries: int, before_ctx, timeout: int, log, sleep=None) -> bool:
+    """Wait until the transcript records one more compaction, or the session's
+    context drops clearly, or the timeout passes."""
+    import time as _t
+    sleep = sleep or _t.sleep
+    deadline = _t.time() + timeout
+    sid = session["session_id"]
+    while _t.time() < deadline:
+        if before_boundaries >= 0 and compact_boundaries(session.get("transcript_path")) > before_boundaries:
+            return True
+        f = sessions_dir() / f"{sid}.json"
+        try:
+            cur = json.loads(f.read_text()).get("context_pct")
+            if isinstance(cur, (int, float)) and isinstance(before_ctx, (int, float)) and cur <= before_ctx - 10:
+                return True
+        except (OSError, ValueError):
+            pass
+        sleep(3)
+    log(f"  {sid[:8]}: compaction not confirmed within {timeout}s; going on")
+    return False
+
+
+# ----------------------------------------------------------------------------- watch: the loop
+
+def notify(title: str, text: str) -> None:
+    if os.environ.get("CCSWITCH_NO_NOTIFY"):
+        return
+    try:
+        subprocess.run(["osascript", "-e", f'display notification "{text}" with title "{title}"'],
+                       capture_output=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def state_path() -> Path:
+    return index_path().parent / "watch-state.json"
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(state_path().read_text())
+    except (OSError, ValueError):
+        return {"last_switch_at": 0, "last_compact": {}, "last_notice": {}}
+
+
+def save_state(st: dict) -> None:
+    _write_json_atomic(state_path(), st)
+
+
+def choose_target(index: dict, current: str | None, switch_at: float) -> list[str]:
+    """Candidates ordered by headroom: the slot with the lowest known five-hour
+    usage first, a window past its reset counting as empty; slots at or above the
+    threshold and the current one are left out."""
+    now = dt.datetime.now(dt.timezone.utc)
+    ranked = []
+    for email, m in index["slots"].items():
+        if email == current:
+            continue
+        w = (m.get("usage") or {}).get("five_hour") or {}
+        pct = w.get("utilization")
+        reset = w.get("resets_at")
+        try:
+            past = bool(reset) and dt.datetime.fromisoformat(reset) < now
+        except ValueError:
+            past = False
+        est = 0.0 if (pct is None or past) else float(pct)
+        if est >= switch_at:
+            continue
+        ranked.append((est, m.get("saved_at") or "", email))
+    return [e for _, _, e in sorted(ranked)]
+
+
+def record_live_usage(index: dict, current: str | None, window: dict | None, weekly: dict | None) -> None:
+    """Keep the index's usage for the current account in step with the feed."""
+    if not current or current not in index["slots"] or not window:
+        return
+    def conv(w):
+        if not w:
+            return None
+        r = w.get("resets_at")
+        if isinstance(r, (int, float)):
+            r = dt.datetime.fromtimestamp(r, dt.timezone.utc).isoformat()
+        return {"utilization": w.get("used_percentage"), "resets_at": r}
+    u = index["slots"][current].setdefault("usage", {})
+    u["five_hour"] = conv(window)
+    if weekly:
+        u["seven_day"] = conv(weekly)
+    u["fetched_at"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+    u["fetched_at_ms"] = now_ms()
+
+
+def do_watch(a) -> int:
+    import time as _t
+    methods = compact_methods(a.compact_via)
+    if a.compact_at is not None and "native" in methods and not a.dry_run:
+        if apply_native_threshold(a.compact_at):
+            say(f"settings: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE={a.compact_at} (applies to sessions started from now)")
+    runtime = [m for m in methods if m != "native"]
+
+    def log(msg: str) -> None:
+        say(f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}")
+
+    log(f"watch: switch at {a.switch_at}% of the five-hour window"
+        + (f", compact at {a.compact_at}% context via {','.join(methods)}" if a.compact_at is not None else ", compaction off")
+        + (f", weekly guard {a.weekly_at}%" if a.weekly_at is not None else "")
+        + (" [dry run]" if a.dry_run else ""))
+
+    while True:
+        st = load_state()
+        now = int(_t.time())
+        sessions = live_sessions()
+        index = load_index()
+        cur = current_email()
+        pct, window = current_usage(sessions, since=st.get("ignore_before", 0))
+        weekly = next((s.get("seven_day") for s in sessions if s.get("seven_day")), None)
+        record_live_usage(index, cur, window, weekly)
+        if not a.dry_run:
+            save_index(index)
+
+        # per-session compaction at the context threshold
+        if a.compact_at is not None and runtime:
+            for s in sessions:
+                ctx = s.get("context_pct")
+                sid = s["session_id"]
+                if not isinstance(ctx, (int, float)) or ctx < a.compact_at:
+                    continue
+                if now - int(st["last_compact"].get(sid, 0)) < a.compact_cooldown:
+                    continue
+                log(f"session {sid[:8]} at {ctx:.0f}% context: compacting")
+                if not a.dry_run and send_compact(s, runtime, a.force, log):
+                    st["last_compact"][sid] = now
+            save_state(st) if not a.dry_run else None
+
+        # the account switch at the usage threshold
+        weekly_pct = (weekly or {}).get("used_percentage") if weekly else None
+        over = (pct is not None and pct >= a.switch_at) or \
+               (a.weekly_at is not None and isinstance(weekly_pct, (int, float)) and weekly_pct >= a.weekly_at)
+        if pct is None and not sessions:
+            log("no live session feed; waiting") if a.verbose else None
+        elif over and now - int(st.get("last_switch_at", 0)) < a.cooldown:
+            log(f"{pct:.0f}% but within cooldown; waiting") if a.verbose else None
+        elif over:
+            candidates = choose_target(index, cur, a.switch_at)
+            log(f"{cur or '?'} at {pct if pct is not None else '?'}% (weekly {weekly_pct}); candidates: {', '.join(candidates) or 'none'}")
+            if not candidates:
+                if now - int(st["last_notice"].get("none", 0)) > a.cooldown:
+                    notify("ccswitch", "every saved account is at or above the threshold; nothing to switch to")
+                    st["last_notice"]["none"] = now
+                    save_state(st) if not a.dry_run else None
+            else:
+                if runtime and sessions:
+                    log(f"compacting {len(sessions)} session(s) before the switch")
+                    marks = []
+                    for s in sessions:
+                        if a.dry_run:
+                            continue
+                        b = compact_boundaries(s.get("transcript_path"))
+                        if send_compact(s, runtime, a.force, log):
+                            marks.append((s, b, s.get("context_pct")))
+                            st["last_compact"][s["session_id"]] = now
+                    for s, b, c in marks:
+                        wait_compacted(s, b, c, a.compact_timeout, log)
+                switched = None
+                for target in candidates:
+                    if a.dry_run:
+                        log(f"would switch {cur} -> {target}")
+                        switched = target
+                        break
+                    rc = do_switch(target, assume_yes=True, probe=False)
+                    if rc == 0:
+                        switched = target
+                        break
+                    log(f"switch to {target} failed (rc {rc}); trying the next candidate")
+                if switched:
+                    st["last_switch_at"] = now
+                    st["ignore_before"] = now + 35       # feed samples older than this still show the old account
+                    notify("ccswitch", f"{cur or '?'} hit {pct:.0f}%; switched to {switched}")
+                    log(f"switched {cur} -> {switched}")
+                else:
+                    notify("ccswitch", "usage threshold hit but every switch failed; log in: claude auth login --email <addr> && ccswitch save")
+                    st["last_notice"]["fail"] = now
+                save_state(st) if not a.dry_run else None
+        elif a.verbose:
+            log(f"{cur or '?'} at {pct if pct is not None else '?'}%, {len(sessions)} session(s)")
+
+        if a.once:
+            return 0
+        _t.sleep(a.interval)
+
+
+# ----------------------------------------------------------------------------- daemon (launchd)
+
+LABEL = "com.ccswitch.watch"
+
+
+def plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+
+
+def log_path() -> Path:
+    return Path.home() / "Library" / "Logs" / "ccswitch.log"
+
+
+def install_statusline_tee() -> str:
+    """Point the settings' status line at the tee, keeping the original command."""
+    sp = settings_path()
+    try:
+        d = json.loads(sp.read_text()) if sp.exists() else {}
+    except ValueError:
+        raise Fail(f"{sp} is not valid JSON; not touching it")
+    me = f"'{Path(__file__).resolve()}' statusline-tee"
+    sl = d.get("statusLine") or {}
+    cmd = sl.get("command") if isinstance(sl, dict) else None
+    if cmd == me:
+        return "already installed"
+    rec = statusline_record()
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(rec, {"command": cmd, "type": sl.get("type") if isinstance(sl, dict) else None,
+                             "refreshInterval": sl.get("refreshInterval") if isinstance(sl, dict) else None})
+    new = dict(sl) if isinstance(sl, dict) else {}
+    new.update({"type": "command", "command": me})
+    new.setdefault("refreshInterval", 10)
+    d["statusLine"] = new
+    _write_json_atomic(sp, d)
+    return f"installed (original kept in {rec})"
+
+
+def restore_statusline() -> str:
+    sp = settings_path()
+    rec = statusline_record()
+    if not rec.exists():
+        return "nothing to restore"
+    saved = json.loads(rec.read_text())
+    try:
+        d = json.loads(sp.read_text()) if sp.exists() else {}
+    except ValueError:
+        raise Fail(f"{sp} is not valid JSON; not touching it")
+    if saved.get("command"):
+        d["statusLine"] = {k: v for k, v in (("type", saved.get("type") or "command"), ("command", saved["command"]),
+                                            ("refreshInterval", saved.get("refreshInterval"))) if v is not None}
+    else:
+        d.pop("statusLine", None)
+    _write_json_atomic(sp, d)
+    rec.unlink()
+    return "restored"
+
+
+def _plist(args: list[str]) -> str:
+    def esc(x: str) -> str:
+        return x.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    dirs = []
+    for b in (claude_bin(), cmux_bin(), security_bin()):
+        w = shutil.which(b) or b
+        d = str(Path(w).resolve().parent)
+        if d not in dirs:
+            dirs.append(d)
+    path = ":".join(dirs + ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"])
+    prog = "".join(f"\n      <string>{esc(x)}</string>" for x in [sys.executable, str(Path(__file__).resolve()), "watch", *args])
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>{prog}
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>{esc(path)}</string>
+    <key>HOME</key><string>{esc(str(Path.home()))}</string>{(chr(10) + '    <key>CLAUDE_CONFIG_DIR</key><string>' + esc(os.environ['CLAUDE_CONFIG_DIR']) + '</string>') if os.environ.get('CLAUDE_CONFIG_DIR') else ''}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>{esc(str(log_path()))}</string>
+  <key>StandardErrorPath</key><string>{esc(str(log_path()))}</string>
+</dict>
+</plist>
+"""
+
+
+def _num(x) -> str:
+    return str(int(x)) if float(x).is_integer() else str(x)
+
+
+def do_daemon(a) -> int:
+    uid = os.getuid()
+    if a.action == "install":
+        watch_args = ["--switch-at", _num(a.switch_at), "--interval", str(a.interval), "--cooldown", str(a.cooldown),
+                      "--compact-via", a.compact_via, "--compact-timeout", str(a.compact_timeout)]
+        if a.compact_at is not None:
+            watch_args += ["--compact-at", _num(a.compact_at)]
+        if a.weekly_at is not None:
+            watch_args += ["--weekly-at", _num(a.weekly_at)]
+        if a.force:
+            watch_args.append("--force")
+        say(f"status line: {install_statusline_tee()}")
+        if a.compact_at is not None and "native" in compact_methods(a.compact_via):
+            apply_native_threshold(a.compact_at)
+            say(f"settings: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE={a.compact_at}")
+        pp = plist_path()
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        log_path().parent.mkdir(parents=True, exist_ok=True)
+        if a.no_launchd:
+            pp.write_text(_plist(watch_args))
+            say(f"wrote {pp} (not loaded: --no-launchd)")
+            return 0
+        _run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+        pp.write_text(_plist(watch_args))
+        p = _run(["launchctl", "bootstrap", f"gui/{uid}", str(pp)])
+        if p.returncode != 0:
+            raise Fail(f"launchctl bootstrap failed: {(p.stderr or p.stdout).strip()[:200]}")
+        say(f"daemon running: {LABEL} (log: {log_path()}); `ccswitch daemon status` to check it")
+        return 0
+    if a.action == "uninstall":
+        if not a.no_launchd:
+            _run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+        if plist_path().exists():
+            plist_path().unlink()
+        say(f"status line: {restore_statusline()}")
+        if apply_native_threshold(None):
+            say("settings: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE removed")
+        say("daemon removed")
+        return 0
+    if a.action == "status":
+        p = _run(["launchctl", "print", f"gui/{uid}/{LABEL}"])
+        if p.returncode != 0:
+            print("daemon: not loaded")
+        else:
+            m = re.search(r"state = (\w+)", p.stdout)
+            pid = re.search(r"pid = (\d+)", p.stdout)
+            print(f"daemon: {m.group(1) if m else 'loaded'}" + (f" (pid {pid.group(1)})" if pid else ""))
+        print(f"plist : {plist_path()} ({'present' if plist_path().exists() else 'absent'})")
+        print(f"tee   : {'installed' if statusline_record().exists() else 'not installed'}")
+        print(f"feed  : {len(live_sessions())} live session(s)")
+        for s in live_sessions():
+            fh = (s.get("five_hour") or {}).get("used_percentage")
+            print(f"  {s['session_id'][:8]}  ctx {s.get('context_pct') or '?'}%  5h {fh if fh is not None else '?'}%  {s.get('cwd') or ''}")
+        st = load_state()
+        if st.get("last_switch_at"):
+            print(f"last switch: {iso(st['last_switch_at'] * 1000)}")
+        return 0
+    if a.action == "log":
+        p = _run(["tail", "-n", str(a.lines), str(log_path())])
+        print(p.stdout, end="")
+        return 0
+    return 1
+
+
 # ----------------------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
@@ -600,9 +1151,34 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("name")
     s.add_argument("-y", "--yes", action="store_true")
     sub.add_parser("doctor", help="check the Keychain items, the index and every slot")
+    sub.add_parser("statusline-tee", help="(internal) the status-line command that records the usage feed")
+
+    def watch_args(sp):
+        sp.add_argument("--switch-at", type=float, default=90, help="five-hour usage %% at which to switch (default 90)")
+        sp.add_argument("--compact-at", type=float, default=None, help="context %% at which a session is compacted (off unless given)")
+        sp.add_argument("--compact-via", default="native,cmux",
+                        help="comma list of native, cmux, cmd:<command> (default native,cmux)")
+        sp.add_argument("--weekly-at", type=float, default=None, help="also switch when the weekly window reaches this %%")
+        sp.add_argument("--interval", type=int, default=15, help="seconds between checks (default 15)")
+        sp.add_argument("--cooldown", type=int, default=300, help="seconds after a switch before another (default 300)")
+        sp.add_argument("--compact-cooldown", type=int, default=600, help="seconds before the same session is compacted again")
+        sp.add_argument("--compact-timeout", type=int, default=180, help="seconds to wait for a compaction before switching anyway")
+        sp.add_argument("--force", action="store_true", help="let cmux type into a session even when a dialog is open")
+
+    s = sub.add_parser("watch", help="the daemon loop, in the foreground")
+    watch_args(s)
+    s.add_argument("--once", action="store_true", help="one pass, then exit")
+    s.add_argument("--dry-run", action="store_true", help="decide and log, change nothing")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s = sub.add_parser("daemon", help="install | uninstall | status | log the launchd agent")
+    s.add_argument("action", choices=["install", "uninstall", "status", "log"])
+    watch_args(s)
+    s.add_argument("--no-launchd", action="store_true", help="write the plist but do not load it")
+    s.add_argument("--lines", type=int, default=40)
 
     argv = sys.argv[1:] if argv is None else argv
-    known = {"save", "switch", "list", "status", "login", "remove", "doctor", "-h", "--help", "--version"}
+    known = {"save", "switch", "list", "status", "login", "remove", "doctor", "statusline-tee", "watch", "daemon",
+             "-h", "--help", "--version"}
     if argv and argv[0] not in known and not argv[0].startswith("-"):
         argv = ["switch"] + argv
     a = ap.parse_args(argv)
@@ -622,6 +1198,12 @@ def main(argv: list[str] | None = None) -> int:
             return do_remove(a.name, a.yes)
         if a.cmd == "doctor":
             return do_doctor()
+        if a.cmd == "statusline-tee":
+            return do_statusline_tee()
+        if a.cmd == "watch":
+            return do_watch(a)
+        if a.cmd == "daemon":
+            return do_daemon(a)
         ap.print_help()
         return 0
     except Fail as e:

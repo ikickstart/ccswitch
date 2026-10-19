@@ -285,6 +285,11 @@ def resolve_target(name: str, index: dict) -> str:
     n = name.lower()
     if n in slots:
         return n
+    if n.isdigit():
+        ordered = sorted(slots)
+        if 1 <= int(n) <= len(ordered):
+            return ordered[int(n) - 1]
+        raise Fail(f"no slot number {n}; `ccswitch list` numbers them 1-{len(ordered)}")
     hits = [e for e in slots if e.startswith(n) or e.split("@", 1)[0].startswith(n)]
     if len(hits) == 1:
         return hits[0]
@@ -377,9 +382,9 @@ def do_save(as_email: str | None, quiet: bool = False) -> str:
     return email
 
 
-def do_switch(name: str, assume_yes: bool, probe: bool) -> int:
+def do_switch(name: str, assume_yes: bool, probe: bool, ask: bool = False) -> int:
     index = load_index()
-    target = resolve_target(name, index)
+    target = resolve_target(name, index) if name != "next" else next_target(index)
     live, account = read_live()
     cur = current_email()
     if live is not None and cur == target:
@@ -396,14 +401,15 @@ def do_switch(name: str, assume_yes: bool, probe: bool) -> int:
         return 2
 
     meta = index["slots"].get(target, {})
-    u = meta.get("usage", {})
-    bars = ", ".join(f"{k.replace('_', ' ')} {v.get('utilization')}% (resets {local(v.get('resets_at'))})"
-                     for k, v in u.items() if isinstance(v, dict))
-    say(f"switch {cur or '(nobody)'} -> {target}  [{meta.get('plan') or '?'} / {meta.get('org') or '?'}]")
-    say(f"  slot saved {meta.get('saved_at', '?')}" + (f"; last seen {bars}" if bars else ""))
-    if not confirm("proceed?", assume_yes):
-        say("aborted")
-        return 1
+    if ask and not assume_yes:
+        u = meta.get("usage", {})
+        bars = ", ".join(f"{k.replace('_', ' ')} {v.get('utilization')}% (resets {local(v.get('resets_at'))})"
+                         for k, v in u.items() if isinstance(v, dict))
+        say(f"{cur or '(nobody)'} -> {target}  [{meta.get('plan') or '?'} / {meta.get('org') or '?'}]"
+            + (f"; last seen {bars}" if bars else ""))
+        if not confirm("proceed?", False):
+            say("aborted")
+            return 1
 
     # 1. keep the outgoing login fresh in its slot (refresh tokens rotate)
     if live is not None and cur and oauth_dead(live["claudeAiOauth"]) is None:
@@ -436,7 +442,7 @@ def do_switch(name: str, assume_yes: bool, probe: bool) -> int:
         say(f"warning: claude auth status reports {seen or 'not logged in'}; if sessions do not follow, recapture:")
         say(fallback_line(target))
         return 3
-    say(f"now on {target}. Open sessions follow within ~30s.")
+    say(f"now on {target} (was {cur or 'nobody'}); open sessions follow within ~30s")
 
     if probe:
         ok = do_probe()
@@ -481,10 +487,10 @@ def do_list() -> int:
             (m.get("saved_at") or "?")[:16].replace("T", " "),
         ))
     w = max(len(r[1]) for r in rows)
-    print(f"  {'account':<{w}}  {'plan':<10} {'5h':<22} {'7d':<22} saved (UTC)")
-    for r in rows:
-        print(f"{r[0]} {r[1]:<{w}}  {r[2]:<10} {r[3]:<22} {r[4]:<22} {r[5]}")
-    print("\n* = current. Usage is the snapshot taken when the slot was last saved; a window past its reset is empty.")
+    print(f"     {'account':<{w}}  {'plan':<10} {'5h':<22} {'7d':<22} saved (UTC)")
+    for i, r in enumerate(rows, 1):
+        print(f"{r[0]} {i:>2} {r[1]:<{w}}  {r[2]:<10} {r[3]:<22} {r[4]:<22} {r[5]}")
+    print("\n* = current. `ccswitch <number|prefix|email|next>` switches. Usage is the snapshot from the last save; past its reset = empty.")
     return 0
 
 
@@ -856,6 +862,13 @@ def choose_target(index: dict, current: str | None, switch_at: float) -> list[st
     return [e for _, _, e in sorted(ranked)]
 
 
+def next_target(index: dict) -> str:
+    cands = choose_target(index, current_email(), 101)
+    if not cands:
+        raise Fail("no other slot to switch to")
+    return cands[0]
+
+
 def record_live_usage(index: dict, current: str | None, window: dict | None, weekly: dict | None) -> None:
     """Keep the index's usage for the current account in step with the feed."""
     if not current or current not in index["slots"] or not window:
@@ -1139,15 +1152,16 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="ccswitch",
         description="Switch the Claude Code login between your own accounts, no browser, no restart.",
-        epilog="`ccswitch <email-or-prefix>` is shorthand for `ccswitch switch <email-or-prefix>`.",
+        epilog="`ccswitch <target>` is `ccswitch switch <target>`; a bare `ccswitch` lists the slots.",
     )
     ap.add_argument("--version", action="version", version=f"ccswitch {VERSION}")
     sub = ap.add_subparsers(dest="cmd")
     s = sub.add_parser("save", help="snapshot the current login into its slot")
     s.add_argument("--as", dest="as_email", help="the email to file it under, when status cannot tell")
-    s = sub.add_parser("switch", help="load a slot into the live login")
+    s = sub.add_parser("switch", help="load a slot into the live login (email, unique prefix, number from `list`, or `next`)")
     s.add_argument("name")
-    s.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    s.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("-i", "--ask", action="store_true", help="show the slot and ask before switching")
     s.add_argument("--probe", action="store_true", help="send one tiny request afterwards to prove the token works")
     sub.add_parser("list", help="the saved slots with their last known usage")
     sub.add_parser("status", help="who is logged in now, and the cached usage bars")
@@ -1194,7 +1208,7 @@ def main(argv: list[str] | None = None) -> int:
             do_save(a.as_email)
             return 0
         if a.cmd == "switch":
-            return do_switch(a.name, a.yes, a.probe)
+            return do_switch(a.name, a.yes, a.probe, ask=a.ask)
         if a.cmd == "list":
             return do_list()
         if a.cmd == "status":
@@ -1211,6 +1225,8 @@ def main(argv: list[str] | None = None) -> int:
             return do_watch(a)
         if a.cmd == "daemon":
             return do_daemon(a)
+        if not argv:
+            return do_list()
         ap.print_help()
         return 0
     except Fail as e:

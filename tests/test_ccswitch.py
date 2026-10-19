@@ -158,11 +158,27 @@ class Switch(Base):
         self.assertIn("ambiguous", p.stderr)
         self.assertEqual(self.cc("nobody", "-y").returncode, 2)
 
-    def test_without_a_tty_the_switch_needs_dash_y(self):
+    def test_a_switch_does_not_ask_unless_told_to(self):
         p = self.cc("a")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+        self.assertEqual(p.stderr.strip().count("\n"), 0, "one line of output")
+        p = self.cc("b", "--ask")
         self.assertEqual(p.returncode, 2)
-        self.assertIn("-y", p.stderr)
+        self.assertIn("not a terminal", p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+
+    def test_a_number_from_the_list_and_next_both_switch(self):
+        self.assertEqual(self.cc("1").returncode, 0)          # sorted: a, b
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+        self.assertEqual(self.cc("9").returncode, 2)
+        self.assertEqual(self.cc("next").returncode, 0)       # the only other slot
         self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
+
+    def test_bare_ccswitch_lists(self):
+        p = self.cc()
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("* ", p.stdout)
 
     def test_probe_reports_a_refused_token(self):
         kc = self.keychain()
@@ -176,8 +192,8 @@ class Switch(Base):
     def test_list_marks_the_current_account_and_never_prints_a_token(self):
         p = self.cc("list")
         self.assertEqual(p.returncode, 0)
-        self.assertIn("* b@x.com", p.stdout)
-        self.assertIn("  a@x.com", p.stdout)
+        self.assertRegex(p.stdout, r"\* +2 b@x.com")
+        self.assertRegex(p.stdout, r"  +1 a@x.com")
         self.assertNotIn("rt-", p.stdout + p.stderr)
 
     def test_remove_forgets_the_slot_only(self):

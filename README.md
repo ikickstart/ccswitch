@@ -4,16 +4,13 @@ Switch the Claude Code login between your own accounts. No browser, no restart,
 every open session follows, every conversation keeps its context.
 
 ```
-$ ccswitch list
-  account                       plan   5h                      7d                      saved (UTC)
-* manish@example.com            team   88% until Sun 16:49     21% until Mon 22:29     2026-10-19 11:02
-  second@example.com            max    0% (reset)              35% until Tue 09:00     2026-10-18 20:11
+$ ccswitch
+     account                       plan   5h                      7d                      saved (UTC)
+*  1 manish@example.com            team   88% until Sun 16:49     21% until Mon 22:29     2026-10-19 11:02
+   2 second@example.com            max    0% (reset)              35% until Tue 09:00     2026-10-18 20:11
 
 $ ccswitch second
-switch manish@example.com -> second@example.com  [max / Second org]
-  slot saved 2026-10-18T20:11:40+00:00; last seen five hour 0% (resets Sat 09:00), seven day 35% (resets Tue 09:00)
-proceed? [y/N] y
-now on second@example.com. Open sessions follow within ~30s.
+now on second@example.com (was manish@example.com); open sessions follow within ~30s
 ```
 
 macOS only. Python 3.10+, standard library only, nothing to install beyond the
@@ -72,16 +69,18 @@ next account. Signing out of the website does not touch any Claude Code login.
 If the browser was signed in as someone else, `ccswitch login` says so, saves
 the slot under the account it actually got, and exits 3.
 
-Run these in a normal terminal. From inside a Claude Code session (the `!`
-prefix) stdin is not a terminal, so `ccswitch <email>` needs `-y`.
+Run the logins in a normal terminal; a switch works from anywhere, including
+the `!` prefix inside a Claude Code session.
 
 ## Use
 
 ```sh
-ccswitch list               # slots and their last known usage
+ccswitch                    # the slots, numbered, with their last known usage
 ccswitch status             # who is logged in now
-ccswitch second             # switch; an unambiguous prefix is enough
-ccswitch second -y          # without the question
+ccswitch second             # switch: a unique prefix, the full email, or the number from the list
+ccswitch 2                  # same thing by number
+ccswitch next               # the saved account with the most headroom
+ccswitch second --ask       # show the slot and ask first (a switch never asks otherwise)
 ccswitch second --probe     # also send one tiny request to prove the token works
 ccswitch doctor             # check the live item, the index and every slot
 ccswitch daemon install --switch-at 90 --compact-at 80   # see below

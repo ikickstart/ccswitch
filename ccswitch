@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""ccswitch - switch the Claude Code login between your own accounts without a browser.
+
+Claude Code keeps its login in one macOS Keychain item and re-reads it every
+~30 seconds in every running session. ccswitch snapshots that item into a
+Keychain slot per account and swaps the chosen slot back into the live item,
+so every open session continues on the other account with its context intact.
+
+Nothing here talks to Anthropic. The only network path is the real
+`claude auth login`, which is the fallback whenever a slot has died.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+LIVE_SERVICE = "Claude Code-credentials"   # the item Claude Code reads and writes
+SLOT_SERVICE = "ccswitch"                  # our slots: one item per account email
+SLOT_FORMAT = 1
+STDIN_LIMIT = 4096                         # `security -i` line limit; argv above it, like Claude Code
+
+
+class Fail(Exception):
+    """A user-facing error. The message never contains a token."""
+
+
+# ----------------------------------------------------------------------------- paths
+
+def config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def config_json() -> Path:
+    """`.claude.json` sits inside CLAUDE_CONFIG_DIR when that is set, else at ~."""
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return config_dir() / ".claude.json"
+    return Path.home() / ".claude.json"
+
+
+def index_path() -> Path:
+    home = os.environ.get("CCSWITCH_HOME")
+    base = Path(home) if home else Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ccswitch"
+    return base / "slots.json"
+
+
+def security_bin() -> str:
+    return os.environ.get("CCSWITCH_SECURITY") or shutil.which("security") or "/usr/bin/security"
+
+
+def claude_bin() -> str:
+    return os.environ.get("CCSWITCH_CLAUDE") or shutil.which("claude") or "claude"
+
+
+# ----------------------------------------------------------------------------- keychain
+
+def _run(args: list[str], *, input_text: str | None = None, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(args, input=input_text, capture_output=True, text=True, timeout=timeout)
+
+
+def kc_read(service: str, account: str | None = None) -> str | None:
+    """The password of a generic item, or None when there is no such item."""
+    args = [security_bin(), "find-generic-password", "-s", service]
+    if account:
+        args += ["-a", account]
+    args.append("-w")
+    p = _run(args)
+    if p.returncode != 0:
+        if "could not be found" in (p.stderr + p.stdout) or p.returncode == 44:
+            return None
+        raise Fail(f"security find-generic-password failed (exit {p.returncode})")
+    return p.stdout.rstrip("\n")
+
+
+def kc_account(service: str) -> str | None:
+    """The account name of an item, read from its attributes."""
+    p = _run([security_bin(), "find-generic-password", "-s", service])
+    if p.returncode != 0:
+        return None
+    m = re.search(r'"acct"<blob>="([^"]*)"', p.stdout)
+    return m.group(1) if m else None
+
+
+def kc_write(service: str, account: str, secret: str) -> None:
+    """Create or update an item. The secret goes over stdin (`security -i`) so it
+    never shows in `ps`; above the stdin line limit it goes as hex argv, which is
+    what Claude Code itself does."""
+    hexed = secret.encode("utf-8").hex()
+    line = f'add-generic-password -U -a "{account}" -s "{service}" -X {hexed}\n'
+    if len(line) <= STDIN_LIMIT:
+        p = _run([security_bin(), "-i"], input_text=line)
+    else:
+        p = _run([security_bin(), "add-generic-password", "-U", "-a", account, "-s", service, "-X", hexed])
+    if p.returncode != 0:
+        raise Fail(f"security add-generic-password failed (exit {p.returncode})")
+
+
+def kc_delete(service: str, account: str) -> bool:
+    p = _run([security_bin(), "delete-generic-password", "-a", account, "-s", service])
+    return p.returncode == 0
+
+
+# ----------------------------------------------------------------------------- live credential
+
+def _shape_ok(doc) -> bool:
+    if not isinstance(doc, dict):
+        return False
+    o = doc.get("claudeAiOauth")
+    return (isinstance(o, dict)
+            and isinstance(o.get("accessToken"), str)
+            and isinstance(o.get("refreshToken"), str))
+
+
+def read_live() -> tuple[dict | None, str]:
+    """(credential document or None, keychain account name)."""
+    account = kc_account(LIVE_SERVICE) or os.environ.get("USER") or "unknown"
+    raw = kc_read(LIVE_SERVICE)
+    if raw is None:
+        return None, account
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        raise Fail("the live credential is not JSON; refusing to touch it")
+    if not _shape_ok(doc):
+        raise Fail("the live credential does not have the claudeAiOauth shape this version knows; refusing to touch it")
+    return doc, account
+
+
+def write_live(doc: dict, account: str) -> None:
+    if not _shape_ok(doc):
+        raise Fail("refusing to write a credential without the claudeAiOauth shape")
+    kc_write(LIVE_SERVICE, account, json.dumps(doc, separators=(",", ":")))
+
+
+def oauth_dead(o: dict) -> str | None:
+    """Why a claudeAiOauth block cannot be used, or None."""
+    if not o.get("refreshToken"):
+        return "its refresh token was blanked (Claude Code marked it dead)"
+    exp = o.get("refreshTokenExpiresAt")
+    if isinstance(exp, (int, float)) and exp and exp < now_ms():
+        return "its refresh token expired on " + iso(exp)
+    return None
+
+
+# ----------------------------------------------------------------------------- claude.json
+
+def load_config() -> dict:
+    p = config_json()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except ValueError:
+        raise Fail(f"{p} is not valid JSON; refusing to rewrite it")
+
+
+def save_config(d: dict) -> None:
+    p = config_json()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".claude.json.", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f, indent=2)
+            f.write("\n")
+        if p.exists():
+            os.chmod(tmp, p.stat().st_mode & 0o777)
+        os.replace(tmp, p)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def current_email(cfg: dict | None = None) -> str | None:
+    cfg = load_config() if cfg is None else cfg
+    e = (cfg.get("oauthAccount") or {}).get("emailAddress")
+    return e.lower() if isinstance(e, str) and e else None
+
+
+# ----------------------------------------------------------------------------- claude cli
+
+def auth_status() -> dict:
+    try:
+        p = _run([claude_bin(), "auth", "status", "--json"], timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    try:
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+    except ValueError:
+        return {}
+
+
+# ----------------------------------------------------------------------------- slots
+
+def load_index() -> dict:
+    p = index_path()
+    if not p.exists():
+        return {"format": SLOT_FORMAT, "slots": {}}
+    try:
+        d = json.loads(p.read_text())
+    except ValueError:
+        raise Fail(f"{p} is not valid JSON")
+    d.setdefault("slots", {})
+    return d
+
+
+def save_index(d: dict) -> None:
+    p = index_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="slots.", dir=p.parent)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+
+
+def usage_summary(cu: dict | None) -> dict:
+    """The two bars, from Claude Code's cached snapshot. Never a secret."""
+    out = {}
+    if not isinstance(cu, dict):
+        return out
+    u = cu.get("utilization") or {}
+    for k in ("five_hour", "seven_day"):
+        w = u.get(k) or {}
+        if isinstance(w, dict) and "utilization" in w:
+            out[k] = {"utilization": w.get("utilization"), "resets_at": w.get("resets_at")}
+    if cu.get("fetchedAtMs"):
+        out["fetched_at"] = iso(cu["fetchedAtMs"])
+    return out
+
+
+def slot_read(email: str) -> dict | None:
+    raw = kc_read(SLOT_SERVICE, email)
+    if raw is None:
+        return None
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        raise Fail(f"slot {email} is not JSON")
+    if d.get("format") != SLOT_FORMAT or not _shape_ok(d.get("credentials")):
+        raise Fail(f"slot {email} has a shape this version does not know")
+    return d
+
+
+def slot_write(email: str, slot: dict) -> None:
+    kc_write(SLOT_SERVICE, email, json.dumps(slot, separators=(",", ":")))
+
+
+def resolve_target(name: str, index: dict) -> str:
+    """An exact email, or a unique case-insensitive prefix of one."""
+    slots = index["slots"]
+    n = name.lower()
+    if n in slots:
+        return n
+    hits = [e for e in slots if e.startswith(n) or e.split("@", 1)[0].startswith(n)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise Fail(f"no slot matches '{name}'. Saved slots: {', '.join(sorted(slots)) or 'none'}")
+    raise Fail(f"'{name}' is ambiguous: {', '.join(sorted(hits))}")
+
+
+# ----------------------------------------------------------------------------- helpers
+
+def now_ms() -> int:
+    return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+
+
+def iso(ms) -> str:
+    try:
+        return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return "?"
+
+
+def local(iso_text: str | None) -> str:
+    if not iso_text:
+        return "?"
+    try:
+        return dt.datetime.fromisoformat(iso_text).astimezone().strftime("%a %H:%M")
+    except ValueError:
+        return iso_text
+
+
+def say(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def confirm(prompt: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise Fail("not a terminal; pass -y to confirm non-interactively")
+    try:
+        return input(prompt + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def fallback_line(email: str) -> str:
+    return f"  claude auth login --email {email} && ccswitch save"
+
+
+# ----------------------------------------------------------------------------- commands
+
+def do_save(as_email: str | None, quiet: bool = False) -> str:
+    live, _ = read_live()
+    if live is None:
+        raise Fail("nothing is logged in; run `claude auth login --email <addr>` first")
+    dead = oauth_dead(live["claudeAiOauth"])
+    if dead:
+        raise Fail(f"the live login cannot be saved: {dead}. Log in again:\n" + fallback_line(as_email or current_email() or "<addr>"))
+    cfg = load_config()
+    status = auth_status()
+    email = (as_email or status.get("email") or current_email(cfg) or "").lower()
+    if not email or "@" not in email:
+        raise Fail("could not tell which account is logged in; pass --as <email>")
+    slot = {
+        "format": SLOT_FORMAT,
+        "email": email,
+        "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "credentials": live,
+        "oauthAccount": cfg.get("oauthAccount"),
+        "cachedUsageUtilization": cfg.get("cachedUsageUtilization"),
+        "status": {k: status.get(k) for k in ("orgName", "subscriptionType", "orgId") if status.get(k)},
+    }
+    slot_write(email, slot)
+    index = load_index()
+    index["slots"][email] = {
+        "saved_at": slot["saved_at"],
+        "org": status.get("orgName") or (cfg.get("oauthAccount") or {}).get("organizationName"),
+        "plan": status.get("subscriptionType") or live["claudeAiOauth"].get("subscriptionType"),
+        "usage": usage_summary(cfg.get("cachedUsageUtilization")),
+        "refresh_expires_at": iso(live["claudeAiOauth"].get("refreshTokenExpiresAt")),
+    }
+    save_index(index)
+    if not quiet:
+        say(f"saved slot {email} ({index['slots'][email].get('plan') or '?'}, {index['slots'][email].get('org') or '?'})")
+    return email
+
+
+def do_switch(name: str, assume_yes: bool, probe: bool) -> int:
+    index = load_index()
+    target = resolve_target(name, index)
+    live, account = read_live()
+    cur = current_email()
+    if live is not None and cur == target:
+        say(f"already on {target}")
+        return 0
+
+    slot = slot_read(target)
+    if slot is None:
+        raise Fail(f"slot {target} is in the index but not in the Keychain. Recapture it:\n" + fallback_line(target))
+    dead = oauth_dead(slot["credentials"]["claudeAiOauth"])
+    if dead:
+        say(f"slot {target} is dead: {dead}. Log in once, then save it again:")
+        say(fallback_line(target))
+        return 2
+
+    meta = index["slots"].get(target, {})
+    u = meta.get("usage", {})
+    bars = ", ".join(f"{k.replace('_', ' ')} {v.get('utilization')}% (resets {local(v.get('resets_at'))})"
+                     for k, v in u.items() if isinstance(v, dict))
+    say(f"switch {cur or '(nobody)'} -> {target}  [{meta.get('plan') or '?'} / {meta.get('org') or '?'}]")
+    say(f"  slot saved {meta.get('saved_at', '?')}" + (f"; last seen {bars}" if bars else ""))
+    if not confirm("proceed?", assume_yes):
+        say("aborted")
+        return 1
+
+    # 1. keep the outgoing login fresh in its slot (refresh tokens rotate)
+    if live is not None and cur and oauth_dead(live["claudeAiOauth"]) is None:
+        do_save(cur, quiet=True)
+
+    # 2. the live item: only the claudeAiOauth block moves; every other key stays
+    new_live = dict(live) if live is not None else {}
+    new_live.update({k: v for k, v in slot["credentials"].items() if k != "claudeAiOauth"})
+    new_live["claudeAiOauth"] = slot["credentials"]["claudeAiOauth"]
+    write_live(new_live, account)
+
+    # 3. the account label and the usage snapshot Claude Code keeps beside it
+    cfg = load_config()
+    if slot.get("oauthAccount"):
+        cfg["oauthAccount"] = slot["oauthAccount"]
+    if slot.get("cachedUsageUtilization"):
+        cfg["cachedUsageUtilization"] = slot["cachedUsageUtilization"]
+    else:
+        cfg.pop("cachedUsageUtilization", None)
+    save_config(cfg)
+
+    # 4. read back: did the write land, and does Claude Code agree?
+    check, _ = read_live()
+    if check is None or check["claudeAiOauth"].get("refreshToken") != new_live["claudeAiOauth"].get("refreshToken"):
+        say("warning: the live credential changed under us (a session was refreshing). Re-run the switch.")
+        return 3
+    status = auth_status()
+    seen = (status.get("email") or "").lower()
+    if status and (not status.get("loggedIn") or (seen and seen != target)):
+        say(f"warning: claude auth status reports {seen or 'not logged in'}; if sessions do not follow, recapture:")
+        say(fallback_line(target))
+        return 3
+    say(f"now on {target}. Open sessions follow within ~30s.")
+
+    if probe:
+        ok = do_probe()
+        if not ok:
+            say(f"probe failed: the slot's token was refused. Log in once, then save:")
+            say(fallback_line(target))
+            return 2
+        say("probe ok: the token works.")
+    return 0
+
+
+def do_probe() -> bool:
+    """One tiny request as the new account. Opt-in: it spends a few tokens."""
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            p = subprocess.run(
+                [claude_bin(), "-p", "Reply with the single word ok.", "--model", "haiku",
+                 "--max-turns", "1", "--no-session-persistence"],
+                cwd=d, capture_output=True, text=True, timeout=90,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+    return p.returncode == 0
+
+
+def do_list() -> int:
+    index = load_index()
+    cur = current_email()
+    if not index["slots"]:
+        say("no slots saved yet. Log in to an account, then: ccswitch save")
+        return 0
+    rows = []
+    for email, m in sorted(index["slots"].items()):
+        u = m.get("usage", {})
+        f = u.get("five_hour", {}) or {}
+        s = u.get("seven_day", {}) or {}
+        rows.append((
+            "*" if email == cur else " ",
+            email,
+            f"{m.get('plan') or '?'}",
+            fmt_bar(f), fmt_bar(s),
+            (m.get("saved_at") or "?")[:16].replace("T", " "),
+        ))
+    w = max(len(r[1]) for r in rows)
+    print(f"  {'account':<{w}}  {'plan':<10} {'5h':<22} {'7d':<22} saved (UTC)")
+    for r in rows:
+        print(f"{r[0]} {r[1]:<{w}}  {r[2]:<10} {r[3]:<22} {r[4]:<22} {r[5]}")
+    print("\n* = current. Usage is the snapshot taken when the slot was last saved; a window past its reset is empty.")
+    return 0
+
+
+def fmt_bar(w: dict) -> str:
+    if not w or w.get("utilization") is None:
+        return "-"
+    reset = w.get("resets_at")
+    try:
+        past = reset and dt.datetime.fromisoformat(reset) < dt.datetime.now(dt.timezone.utc)
+    except ValueError:
+        past = False
+    if past:
+        return "0% (reset)"
+    return f"{w['utilization']}% until {local(reset)}"
+
+
+def do_status() -> int:
+    status = auth_status()
+    cfg = load_config()
+    live, _ = read_live()
+    email = status.get("email") or current_email(cfg) or "(nobody)"
+    print(f"account : {email}")
+    print(f"plan    : {status.get('subscriptionType') or '?'}  org: {status.get('orgName') or '?'}")
+    print(f"keychain: {'present' if live else 'absent'}" + (f" ({oauth_dead(live['claudeAiOauth'])})" if live and oauth_dead(live['claudeAiOauth']) else ""))
+    u = usage_summary(cfg.get("cachedUsageUtilization"))
+    for k in ("five_hour", "seven_day"):
+        if k in u:
+            print(f"{k.replace('_', ' '):<8}: {fmt_bar(u[k])}")
+    index = load_index()
+    print(f"slots   : {len(index['slots'])} saved" + (f" ({'saved' if email.lower() in index['slots'] else 'this one is NOT saved - run: ccswitch save'})" if email != '(nobody)' else ""))
+    return 0
+
+
+def do_login(email: str) -> int:
+    say(f"running the real login for {email}; finish it in the browser, then the slot is saved.")
+    p = subprocess.run([claude_bin(), "auth", "login", "--email", email])
+    if p.returncode != 0:
+        raise Fail(f"claude auth login exited {p.returncode}; nothing saved")
+    do_save(None)
+    return 0
+
+
+def do_remove(name: str, assume_yes: bool) -> int:
+    index = load_index()
+    target = resolve_target(name, index)
+    if not confirm(f"forget slot {target}? (the account stays logged in wherever it is; only the saved copy goes)", assume_yes):
+        say("aborted")
+        return 1
+    kc_delete(SLOT_SERVICE, target)
+    index["slots"].pop(target, None)
+    save_index(index)
+    say(f"removed slot {target}")
+    return 0
+
+
+def do_doctor() -> int:
+    problems = 0
+    if not shutil.which(security_bin()) and not os.path.exists(security_bin()):
+        print("x security: not found (ccswitch needs the macOS Keychain CLI)")
+        problems += 1
+    else:
+        print(f"ok security: {security_bin()}")
+    cb = shutil.which(claude_bin()) or claude_bin()
+    print(f"{'ok' if shutil.which(claude_bin()) else 'x '} claude: {cb}")
+    try:
+        live, account = read_live()
+        if live is None:
+            print("x live login: no Keychain item (nobody is logged in)")
+            problems += 1
+        else:
+            dead = oauth_dead(live["claudeAiOauth"])
+            print(f"{'x ' if dead else 'ok'} live login: item for account '{account}', {current_email() or 'email unknown'}" + (f" - {dead}" if dead else ""))
+            problems += bool(dead)
+    except Fail as e:
+        print(f"x live login: {e}")
+        problems += 1
+    index = load_index()
+    print(f"ok index: {index_path()} ({len(index['slots'])} slots)")
+    for email in sorted(index["slots"]):
+        try:
+            s = slot_read(email)
+        except Fail as e:
+            print(f"x slot {email}: {e}")
+            problems += 1
+            continue
+        if s is None:
+            print(f"x slot {email}: in the index but missing from the Keychain")
+            problems += 1
+            continue
+        dead = oauth_dead(s["credentials"]["claudeAiOauth"])
+        print(f"{'x ' if dead else 'ok'} slot {email}: saved {s.get('saved_at')}" + (f" - {dead}; recapture with: {fallback_line(email).strip()}" if dead else ""))
+        problems += bool(dead)
+    return 1 if problems else 0
+
+
+# ----------------------------------------------------------------------------- main
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="ccswitch",
+        description="Switch the Claude Code login between your own accounts, no browser, no restart.",
+        epilog="`ccswitch <email-or-prefix>` is shorthand for `ccswitch switch <email-or-prefix>`.",
+    )
+    ap.add_argument("--version", action="version", version=f"ccswitch {VERSION}")
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("save", help="snapshot the current login into its slot")
+    s.add_argument("--as", dest="as_email", help="the email to file it under, when status cannot tell")
+    s = sub.add_parser("switch", help="load a slot into the live login")
+    s.add_argument("name")
+    s.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    s.add_argument("--probe", action="store_true", help="send one tiny request afterwards to prove the token works")
+    sub.add_parser("list", help="the saved slots with their last known usage")
+    sub.add_parser("status", help="who is logged in now, and the cached usage bars")
+    s = sub.add_parser("login", help="run the real `claude auth login --email`, then save the slot")
+    s.add_argument("email")
+    s = sub.add_parser("remove", help="forget a slot")
+    s.add_argument("name")
+    s.add_argument("-y", "--yes", action="store_true")
+    sub.add_parser("doctor", help="check the Keychain items, the index and every slot")
+
+    argv = sys.argv[1:] if argv is None else argv
+    known = {"save", "switch", "list", "status", "login", "remove", "doctor", "-h", "--help", "--version"}
+    if argv and argv[0] not in known and not argv[0].startswith("-"):
+        argv = ["switch"] + argv
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "save":
+            do_save(a.as_email)
+            return 0
+        if a.cmd == "switch":
+            return do_switch(a.name, a.yes, a.probe)
+        if a.cmd == "list":
+            return do_list()
+        if a.cmd == "status":
+            return do_status()
+        if a.cmd == "login":
+            return do_login(a.email)
+        if a.cmd == "remove":
+            return do_remove(a.name, a.yes)
+        if a.cmd == "doctor":
+            return do_doctor()
+        ap.print_help()
+        return 0
+    except Fail as e:
+        say(f"ccswitch: {e}")
+        return 2
+    except subprocess.TimeoutExpired:
+        say("ccswitch: a subprocess timed out")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

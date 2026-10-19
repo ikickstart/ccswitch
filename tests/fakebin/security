@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""A fake macOS `security` for the tests: generic passwords in a JSON file at $FAKE_KEYCHAIN."""
+import json, os, shlex, sys
+
+PATH = os.environ["FAKE_KEYCHAIN"]
+
+
+def load():
+    try:
+        return json.load(open(PATH))
+    except (OSError, ValueError):
+        return {}
+
+
+def save(d):
+    json.dump(d, open(PATH, "w"))
+
+
+def opts(args):
+    o, i = {}, 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-U", "-w") and (i + 1 >= len(args) or args[i + 1].startswith("-")):
+            o[a] = True; i += 1
+        elif a.startswith("-"):
+            o[a] = args[i + 1]; i += 2
+        else:
+            i += 1
+    return o
+
+
+def run(argv):
+    if not argv:
+        return 1
+    cmd, o = argv[0], opts(argv[1:])
+    kc = load()
+    if cmd == "find-generic-password":
+        svc = o.get("-s"); acct = o.get("-a")
+        items = kc.get(svc, {})
+        if acct is None and items:
+            acct = sorted(items)[0]
+        if acct not in items:
+            sys.stderr.write("security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n")
+            return 44
+        if o.get("-w"):
+            sys.stdout.write(items[acct] + "\n")
+        else:
+            sys.stdout.write(f'keychain: "login.keychain-db"\nattributes:\n    "acct"<blob>="{acct}"\n    "svce"<blob>="{svc}"\n')
+        return 0
+    if cmd == "add-generic-password":
+        svc, acct = o["-s"], o["-a"]
+        if "-X" in o:
+            pw = bytes.fromhex(o["-X"]).decode()
+        else:
+            pw = o["-w"]
+        if acct in kc.get(svc, {}) and "-U" not in o:
+            sys.stderr.write("security: The specified item already exists in the keychain.\n")
+            return 45
+        kc.setdefault(svc, {})[acct] = pw
+        save(kc)
+        return 0
+    if cmd == "delete-generic-password":
+        svc, acct = o["-s"], o["-a"]
+        if acct not in kc.get(svc, {}):
+            return 44
+        del kc[svc][acct]
+        save(kc)
+        return 0
+    sys.stderr.write(f"fake security: unknown command {cmd}\n")
+    return 1
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["-i"]:
+        rc = 0
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                rc = run(shlex.split(line)) or rc
+        sys.exit(rc)
+    sys.exit(run(sys.argv[1:]))

@@ -97,6 +97,20 @@ within half a minute. `ccswitch list` shows the usage each slot had when it was
 last saved, so you can pick the one with headroom; a window past its reset time
 shows as empty.
 
+## Show the live account in claude-hud
+
+```sh
+ccswitch hud on      # appends "│ acct <alias>" to the end of the first HUD line
+ccswitch hud off
+```
+
+The segment is token-verified: the status-line tee hashes the live Keychain
+token and matches it against the saved slots, so it shows which account is
+really active, not the label in `~/.claude.json` that a running session may
+rewrite. After a token rotation the match is lost until the next `ccswitch
+save` (the daemon does that itself); until then the segment shows the label
+with a `?`. Works with any status-line command, not only claude-hud.
+
 ## The daemon: switch and compact automatically
 
 ```sh

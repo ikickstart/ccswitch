@@ -32,7 +32,7 @@ EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9._%+@-]{1,320}$")   # what may become a Keychain account name
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 RESERVED = {"save", "switch", "list", "status", "login", "remove", "doctor", "statusline-tee", "watch", "daemon",
-            "alias", "unalias", "next"}
+            "alias", "unalias", "hud", "next"}
 
 
 class Fail(Exception):
@@ -306,6 +306,11 @@ def resolve_target(name: str, index: dict) -> str:
 
 # ----------------------------------------------------------------------------- helpers
 
+def sha256_hex(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def now_ms() -> int:
     return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
@@ -385,6 +390,7 @@ def do_save(as_email: str | None, quiet: bool = False) -> str:
     }
     if alias:
         index["slots"][email]["alias"] = alias
+    index["slots"][email]["token_hash"] = sha256_hex(live["claudeAiOauth"]["refreshToken"])
     save_index(index)
     if not quiet:
         say(f"saved slot {email} ({index['slots'][email].get('plan') or '?'}, {index['slots'][email].get('org') or '?'})")
@@ -705,15 +711,61 @@ def do_statusline_tee() -> int:
         orig = json.loads(statusline_record().read_text()).get("command")
     except Exception:
         orig = None
+    out = ""
     if orig:
         try:
             p = subprocess.run(orig, shell=True, input=raw, capture_output=True, text=True, timeout=20)
-            sys.stdout.write(p.stdout)
-            sys.stdout.flush()
-            return 0
+            out = p.stdout
         except Exception:
-            return 0
+            out = ""
+    try:
+        if tee_config().get("account"):
+            seg = hud_segment()
+            if seg:
+                first, nl, rest = out.partition("\n")
+                out = first.rstrip("\r") + seg + nl + rest if out else seg.lstrip() + "\n"
+    except Exception:
+        pass
+    sys.stdout.write(out)
+    sys.stdout.flush()
     return 0
+
+
+def tee_config_path() -> Path:
+    return index_path().parent / "tee.json"
+
+
+def tee_config() -> dict:
+    try:
+        return json.loads(tee_config_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def live_account(index: dict | None = None) -> tuple[str | None, str | None, bool]:
+    """(email, alias, verified): the slot whose token hash equals the live token's,
+    else the label from .claude.json unverified."""
+    index = load_index() if index is None else index
+    try:
+        raw = kc_read(LIVE_SERVICE)
+        live = json.loads(raw)["claudeAiOauth"]["refreshToken"] if raw else ""
+    except (Fail, ValueError, KeyError, TypeError):
+        live = ""
+    if live:
+        h = sha256_hex(live)
+        for email, m in index["slots"].items():
+            if m.get("token_hash") == h:
+                return email, m.get("alias"), True
+    label = current_email()
+    return label, (index["slots"].get(label) or {}).get("alias") if label else None, False
+
+
+def hud_segment(index: dict | None = None) -> str:
+    email, alias, ok = live_account(index)
+    if not email:
+        return ""
+    name = alias or email.split("@", 1)[0]
+    return f" \x1b[2m│ acct\x1b[0m \x1b[35m{name}{'' if ok else '?'}\x1b[0m"
 
 
 def live_sessions(max_age: int = 90) -> list[dict]:
@@ -972,6 +1024,11 @@ def do_watch(a) -> int:
         record_live_usage(index, cur, window, weekly)
         if not a.dry_run:
             save_index(index)
+            if cur in index["slots"] and not live_account(index)[2]:
+                try:
+                    do_save(cur, quiet=True)      # the token rotated since the slot was saved
+                except Fail:
+                    pass
 
         # per-session compaction at the context threshold
         if a.compact_at is not None and runtime:
@@ -1203,6 +1260,28 @@ def do_daemon(a) -> int:
     return 1
 
 
+def do_hud(action: str) -> int:
+    cfg = tee_config()
+    if action == "on":
+        msg = install_statusline_tee()
+        cfg["account"] = True
+        _write_json_atomic(tee_config_path(), cfg)
+        say(f"status line: {msg}; the account now shows at the end of the first HUD line")
+        return 0
+    if action == "off":
+        cfg["account"] = False
+        _write_json_atomic(tee_config_path(), cfg)
+        if not plist_path().exists():
+            say(f"status line: {restore_statusline()}")
+        else:
+            say("account segment off; the tee stays because the daemon uses it")
+        return 0
+    email, alias, ok = live_account()
+    print(f"account segment: {'on' if cfg.get('account') else 'off'}; tee: {'installed' if statusline_record().exists() else 'not installed'}")
+    print(f"live: {email or '(nobody)'}" + (f" ({alias})" if alias else "") + ("" if ok else "  [label only, token not matched to a slot; run: ccswitch save]"))
+    return 0
+
+
 # ----------------------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
@@ -1233,6 +1312,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("target", nargs="?")
     s = sub.add_parser("unalias", help="drop an alias")
     s.add_argument("name")
+    s = sub.add_parser("hud", help="on | off | status: show the live account at the end of the claude-hud line")
+    s.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
     sub.add_parser("statusline-tee", help="(internal) the status-line command that records the usage feed")
 
     def watch_args(sp):
@@ -1284,6 +1365,8 @@ def main(argv: list[str] | None = None) -> int:
             return do_alias(a.name, a.target)
         if a.cmd == "unalias":
             return do_unalias(a.name)
+        if a.cmd == "hud":
+            return do_hud(a.action)
         if a.cmd == "statusline-tee":
             return do_statusline_tee()
         if a.cmd == "watch":

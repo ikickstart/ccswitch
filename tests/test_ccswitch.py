@@ -231,6 +231,44 @@ class Inputs(Base):
         self.assertIn("no slot matches", p.stderr)
 
 
+class Hud(Base):
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.cc("save").returncode, 0)
+        self.assertEqual(self.cc("alias", "aa", "a@x").returncode, 0)
+        (self.home / ".claude").mkdir(exist_ok=True)
+        (self.home / ".claude" / "settings.json").write_text(json.dumps({"statusLine": {"type": "command", "command": "printf 'L1\\nL2\\n'"}}))
+
+    def tee(self):
+        return subprocess.run([sys.executable, str(SCRIPT), "statusline-tee"], env=self.env,
+                              input='{"session_id":"s"}', capture_output=True, text=True).stdout
+
+    def test_hud_on_appends_the_verified_alias_to_the_first_line_and_off_restores(self):
+        p = self.cc("hud", "on")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = self.tee()
+        first, second = out.split("\n")[:2]
+        self.assertIn("acct", first); self.assertIn("aa", first); self.assertNotIn("?", first)
+        self.assertEqual(second, "L2")
+        self.assertIn("statusline-tee", json.loads((self.home / ".claude" / "settings.json").read_text())["statusLine"]["command"])
+        self.assertEqual(self.cc("hud", "off").returncode, 0)
+        self.assertEqual(json.loads((self.home / ".claude" / "settings.json").read_text())["statusLine"]["command"], "printf 'L1\\nL2\\n'")
+
+    def test_a_rotated_token_shows_the_label_with_a_question_mark_until_the_next_save(self):
+        self.assertEqual(self.cc("hud", "on").returncode, 0)
+        kc = self.keychain()
+        doc = json.loads(kc[LIVE]["tester"]); doc["claudeAiOauth"]["refreshToken"] = "rt-a@x.com-rotated"
+        kc[LIVE]["tester"] = json.dumps(doc); self.keychain(kc)
+        self.assertIn("aa?", self.tee())
+        self.assertEqual(self.cc("save").returncode, 0)
+        self.assertIn("aa", self.tee()); self.assertNotIn("aa?", self.tee())
+
+    def test_the_index_holds_a_hash_never_the_token(self):
+        idx = self.index()["slots"]["a@x.com"]
+        self.assertEqual(len(idx["token_hash"]), 64)
+        self.assertNotIn("rt-a@x.com", json.dumps(self.index()))
+
+
 class Login(Base):
     def test_a_browser_signed_in_as_someone_else_is_reported_and_saved_under_the_real_account(self):
         self.env["FAKE_CLAUDE_BROWSER_ACCOUNT"] = "software@x.com"

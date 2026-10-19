@@ -880,7 +880,7 @@ def do_watch(a) -> int:
     def log(msg: str) -> None:
         say(f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}")
 
-    log(f"watch: switch at {a.switch_at}% of the five-hour window"
+    log(f"watch: every {a.interval}s, switch at {a.switch_at}% of the five-hour window"
         + (f", compact at {a.compact_at}% context via {','.join(methods)}" if a.compact_at is not None else ", compaction off")
         + (f", weekly guard {a.weekly_at}%" if a.weekly_at is not None else "")
         + (" [dry run]" if a.dry_run else ""))
@@ -1159,7 +1159,8 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--compact-via", default="native,cmux",
                         help="comma list of native, cmux, cmd:<command> (default native,cmux)")
         sp.add_argument("--weekly-at", type=float, default=None, help="also switch when the weekly window reaches this %%")
-        sp.add_argument("--interval", type=int, default=15, help="seconds between checks (default 15)")
+        sp.add_argument("--interval", type=int, default=300,
+                        help="seconds between checks of usage and context (default 300 = every 5 minutes)")
         sp.add_argument("--cooldown", type=int, default=300, help="seconds after a switch before another (default 300)")
         sp.add_argument("--compact-cooldown", type=int, default=600, help="seconds before the same session is compacted again")
         sp.add_argument("--compact-timeout", type=int, default=180, help="seconds to wait for a compaction before switching anyway")

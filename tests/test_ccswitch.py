@@ -401,6 +401,7 @@ class Watch(Base):
         self.assertIn("<string>--switch-at</string>", plist)
         self.assertIn("<string>85</string>", plist)
         self.assertIn("<string>--compact-at</string>", plist)
+        self.assertIn("<string>--interval</string>\n      <string>300</string>", plist, "checks every 5 minutes by default")
         p = self.cc("daemon", "uninstall", "--no-launchd")
         self.assertEqual(p.returncode, 0, p.stderr)
         d = json.loads(sp.read_text())

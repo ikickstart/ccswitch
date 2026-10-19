@@ -105,9 +105,10 @@ ccswitch daemon uninstall
    `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` into the `env` block of your settings, so
    every session started afterwards compacts itself at 80% context.
 3. **Registers `ccswitch watch` with launchd**, started at login, restarted if it
-   dies, logging to `~/Library/Logs/ccswitch.log`.
+   dies, logging to `~/Library/Logs/ccswitch.log`. It checks usage and context
+   every 5 minutes by default; the feed under it updates every 10 seconds.
 
-The loop, every 15 seconds:
+The loop, every 5 minutes (`--interval`, in seconds, changes it):
 
 - A session whose context is at or above `--compact-at` is asked to compact
   through the runtime methods in `--compact-via` (default `native,cmux`):

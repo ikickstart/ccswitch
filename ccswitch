@@ -520,11 +520,17 @@ def do_status() -> int:
 
 def do_login(email: str) -> int:
     email = check_email(email)
-    say(f"running the real login for {email}; finish it in the browser, then the slot is saved.")
+    say(f"logging in as {email} through the real `claude auth login`.")
+    say("  The browser decides the account: if claude.ai there is already signed in as someone else,")
+    say("  sign out of claude.ai first (or use a private window). That does not touch Claude Code's logins.")
     p = subprocess.run([claude_bin(), "auth", "login", "--email", email])
     if p.returncode != 0:
         raise Fail(f"claude auth login exited {p.returncode}; nothing saved")
-    do_save(None)
+    got = do_save(None)
+    if got != email:
+        say(f"ccswitch: the browser signed in as {got}, not {email}. Saved it under {got}.")
+        say(f"  To capture {email}: sign out of claude.ai in the browser, then run: ccswitch login {email}")
+        return 3
     return 0
 
 

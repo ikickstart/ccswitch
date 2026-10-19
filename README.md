@@ -64,6 +64,17 @@ ccswitch list
 `ccswitch save`. The browser opens once per account and never again, unless a
 slot dies (below).
 
+**The browser decides which account you get.** The authorise page approves
+whichever account claude.ai is signed in as in that browser; the email on the
+command line is only a hint on the sign-in page. So between two logins, sign
+out of claude.ai in the browser (or use a private window) and sign in as the
+next account. Signing out of the website does not touch any Claude Code login.
+If the browser was signed in as someone else, `ccswitch login` says so, saves
+the slot under the account it actually got, and exits 3.
+
+Run these in a normal terminal. From inside a Claude Code session (the `!`
+prefix) stdin is not a terminal, so `ccswitch <email>` needs `-y`.
+
 ## Use
 
 ```sh

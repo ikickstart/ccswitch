@@ -37,7 +37,7 @@ def main(a):
                           "orgName": oa.get("organizationName"), "subscriptionType": l["claudeAiOauth"].get("subscriptionType") if l else None}))
         return 0
     if a[:2] == ["auth", "login"]:
-        email = a[a.index("--email") + 1]
+        email = os.environ.get("FAKE_CLAUDE_BROWSER_ACCOUNT") or a[a.index("--email") + 1]
         d = kc()
         d.setdefault(LIVE, {})["tester"] = json.dumps({"claudeAiOauth": {
             "accessToken": f"at-{email}-{time.time()}", "refreshToken": f"rt-{email}-{time.time()}",

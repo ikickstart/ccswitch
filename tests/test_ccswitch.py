@@ -215,6 +215,22 @@ class Inputs(Base):
         self.assertIn("no slot matches", p.stderr)
 
 
+class Login(Base):
+    def test_a_browser_signed_in_as_someone_else_is_reported_and_saved_under_the_real_account(self):
+        self.env["FAKE_CLAUDE_BROWSER_ACCOUNT"] = "software@x.com"
+        p = self.cc("login", "second@x.com")
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("signed in as software@x.com, not second@x.com", p.stderr)
+        self.assertIn("sign out of claude.ai", p.stderr)
+        self.assertIn("software@x.com", self.keychain()["ccswitch"])
+        self.assertNotIn("second@x.com", self.keychain()["ccswitch"])
+
+    def test_a_matching_login_saves_quietly(self):
+        p = self.cc("login", "second@x.com")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("second@x.com", self.keychain()["ccswitch"])
+
+
 class ConfigDir(Base):
     def test_claude_config_dir_moves_the_json_inside_it(self):
         cdir = self.home / "alt"

@@ -42,7 +42,7 @@ status line may lag for a moment; the token is what is billed.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/ccswitch
+git clone https://github.com/ikickstart/ccswitch
 cd ccswitch && make install        # symlinks ./ccswitch into ~/.local/bin
 ```
 

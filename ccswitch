@@ -764,8 +764,8 @@ def hud_segment(index: dict | None = None) -> str:
     email, alias, ok = live_account(index)
     if not email:
         return ""
-    name = alias or email.split("@", 1)[0]
-    return f" \x1b[2m│ acct\x1b[0m \x1b[35m{name}{'' if ok else '?'}\x1b[0m"
+    text = email + (f" ({alias})" if alias else "") + ("" if ok else " ?")
+    return f" \x1b[2m│\x1b[0m \x1b[35m{text}\x1b[0m"
 
 
 def live_sessions(max_age: int = 90) -> list[dict]:

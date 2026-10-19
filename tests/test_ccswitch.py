@@ -248,7 +248,7 @@ class Hud(Base):
         self.assertEqual(p.returncode, 0, p.stderr)
         out = self.tee()
         first, second = out.split("\n")[:2]
-        self.assertIn("acct", first); self.assertIn("aa", first); self.assertNotIn("?", first)
+        self.assertIn("a@x.com (aa)", first); self.assertNotIn("?", first)
         self.assertEqual(second, "L2")
         self.assertIn("statusline-tee", json.loads((self.home / ".claude" / "settings.json").read_text())["statusLine"]["command"])
         self.assertEqual(self.cc("hud", "off").returncode, 0)
@@ -259,9 +259,9 @@ class Hud(Base):
         kc = self.keychain()
         doc = json.loads(kc[LIVE]["tester"]); doc["claudeAiOauth"]["refreshToken"] = "rt-a@x.com-rotated"
         kc[LIVE]["tester"] = json.dumps(doc); self.keychain(kc)
-        self.assertIn("aa?", self.tee())
+        self.assertIn("a@x.com (aa) ?", self.tee())
         self.assertEqual(self.cc("save").returncode, 0)
-        self.assertIn("aa", self.tee()); self.assertNotIn("aa?", self.tee())
+        self.assertIn("a@x.com (aa)", self.tee()); self.assertNotIn("?", self.tee())
 
     def test_the_index_holds_a_hash_never_the_token(self):
         idx = self.index()["slots"]["a@x.com"]

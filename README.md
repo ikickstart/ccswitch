@@ -100,7 +100,7 @@ shows as empty.
 ## Show the live account in claude-hud
 
 ```sh
-ccswitch hud on      # appends "│ acct <alias>" to the end of the first HUD line
+ccswitch hud on      # appends "│ <email> (<alias>)" to the end of the first HUD line
 ccswitch hud off
 ```
 

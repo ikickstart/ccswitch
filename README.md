@@ -16,7 +16,7 @@ proceed? [y/N] y
 now on second@example.com. Open sessions follow within ~30s.
 ```
 
-macOS only. Python 3.9+, standard library only, nothing to install beyond the
+macOS only. Python 3.10+, standard library only, nothing to install beyond the
 script.
 
 ## Why it works

@@ -247,6 +247,38 @@ class Login(Base):
         self.assertIn("second@x.com", self.keychain()["ccswitch"])
 
 
+class Alias(Base):
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.cc("save").returncode, 0)
+        self.login("b@x.com")
+        self.assertEqual(self.cc("save").returncode, 0)
+
+    def test_alias_set_switch_update_and_remove(self):
+        self.assertEqual(self.cc("alias", "work", "a@x").returncode, 0)
+        self.assertEqual(self.index()["slots"]["a@x.com"]["alias"], "work")
+        self.assertEqual(self.cc("work").returncode, 0)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+        self.assertIn("a@x.com  (work)", self.cc("list").stdout)
+        # moving the alias to another slot takes it away from the first
+        p = self.cc("alias", "work", "2")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("taken from a@x.com", p.stderr)
+        self.assertEqual(self.index()["slots"]["b@x.com"]["alias"], "work")
+        self.assertNotIn("alias", self.index()["slots"]["a@x.com"])
+        self.assertEqual(self.cc("alias").stdout.strip(), "work  b@x.com")
+        self.assertEqual(self.cc("unalias", "work").returncode, 0)
+        self.assertEqual(self.cc("unalias", "work").returncode, 2)
+        self.assertNotIn("alias", self.index()["slots"]["b@x.com"])
+
+    def test_an_alias_survives_a_save_and_cannot_shadow_a_command(self):
+        self.assertEqual(self.cc("alias", "main", "b@x").returncode, 0)
+        self.assertEqual(self.cc("save").returncode, 0)           # b is live; save rewrites its index row
+        self.assertEqual(self.index()["slots"]["b@x.com"]["alias"], "main")
+        for bad in ("list", "next", "save", "Work Space", "1abc", "x" * 40):
+            self.assertEqual(self.cc("alias", bad, "a@x").returncode, 2, bad)
+
+
 class ConfigDir(Base):
     def test_claude_config_dir_moves_the_json_inside_it(self):
         cdir = self.home / "alt"

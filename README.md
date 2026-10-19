@@ -79,6 +79,9 @@ ccswitch                    # the slots, numbered, with their last known usage
 ccswitch status             # who is logged in now
 ccswitch second             # switch: a unique prefix, the full email, or the number from the list
 ccswitch 2                  # same thing by number
+ccswitch alias work second  # name a slot (email, prefix or number); run again to move or rename it
+ccswitch work               # switch by alias
+ccswitch alias              # list aliases; `ccswitch unalias work` drops one
 ccswitch next               # the saved account with the most headroom
 ccswitch second --ask       # show the slot and ask first (a switch never asks otherwise)
 ccswitch second --probe     # also send one tiny request to prove the token works

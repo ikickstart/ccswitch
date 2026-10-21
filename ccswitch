@@ -145,10 +145,20 @@ def _shape_ok(doc) -> bool:
             and isinstance(o.get("refreshToken"), str))
 
 
+def live_keychain_account() -> str:
+    """Claude Code writes its login under the account $USER. A stray item with the
+    same service under another account (e.g. "unknown", MCP tokens only) can exist,
+    and an unqualified lookup may return it, so prefer $USER when that item exists."""
+    user = os.environ.get("USER")
+    if user and ACCOUNT_RE.match(user) and kc_read(LIVE_SERVICE, user) is not None:
+        return user
+    return kc_account(LIVE_SERVICE) or user or "unknown"
+
+
 def read_live() -> tuple[dict | None, str]:
     """(credential document or None, keychain account name)."""
-    account = kc_account(LIVE_SERVICE) or os.environ.get("USER") or "unknown"
-    raw = kc_read(LIVE_SERVICE)
+    account = live_keychain_account()
+    raw = kc_read(LIVE_SERVICE, account)
     if raw is None:
         return None, account
     try:
@@ -747,7 +757,7 @@ def live_account(index: dict | None = None) -> tuple[str | None, str | None, boo
     else the label from .claude.json unverified."""
     index = load_index() if index is None else index
     try:
-        raw = kc_read(LIVE_SERVICE)
+        raw = kc_read(LIVE_SERVICE, live_keychain_account())
         live = json.loads(raw)["claudeAiOauth"]["refreshToken"] if raw else ""
     except (Fail, ValueError, KeyError, TypeError):
         live = ""

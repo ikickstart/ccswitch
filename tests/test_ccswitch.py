@@ -93,6 +93,15 @@ class Save(Base):
         self.assertIn("shape", p.stderr)
         self.assertNotIn("ccswitch", self.keychain())
 
+    def test_save_reads_the_item_of_the_user_not_a_stray_item_with_the_same_service(self):
+        # A stray item (e.g. MCP tokens written when $USER was unset) can sort or search first.
+        self.env["USER"] = "tester"
+        self.keychain({LIVE: {"aaa-stray": json.dumps({"mcpOAuth": {}}),
+                              "tester": json.dumps(oauth("a@x.com"))}})
+        p = self.cc("save")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("a@x.com", self.keychain()["ccswitch"])
+
 
 class Switch(Base):
     def setUp(self):

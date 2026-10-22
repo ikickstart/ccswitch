@@ -18,6 +18,19 @@ def oauth(email, dead=False, expired=False):
         "organizationUuid": f"org-{email}"}
 
 
+# What Claude Code keeps beside the login in the same Keychain item: the OAuth tokens of
+# locally configured MCP servers. They belong to the machine, never to a slot.
+MCP_LIVE = {"plugin:github|9f1c": {"accessToken": "mat-live", "refreshToken": "mrt-live", "expiresAt": 4102444800000,
+                                   "clientId": "cid-live", "scope": "repo read:org", "serverUrl": "https://api.github.com/mcp"}}
+MCP_STALE = {"plugin:github|9f1c": {"accessToken": "mat-stale", "refreshToken": "mrt-stale", "expiresAt": 1,
+                                    "clientId": "cid-live", "scope": "repo", "serverUrl": "https://api.github.com/mcp"},
+             "plugin:linear|0a2b": {"accessToken": "mat-gone", "refreshToken": "mrt-gone"}}
+
+
+def raw(obj):
+    return json.dumps(obj, separators=(",", ":"))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -49,6 +62,20 @@ class Base(unittest.TestCase):
     def live(self):
         return json.loads(next(iter(self.keychain()[LIVE].values())))
 
+    def live_raw(self):
+        return next(iter(self.keychain()[LIVE].values()))
+
+    def set_live(self, doc):
+        kc = self.keychain()
+        acct = next(iter(kc[LIVE])) if kc.get(LIVE) else "tester"
+        kc.setdefault(LIVE, {})[acct] = json.dumps(doc, separators=(",", ":"))
+        self.keychain(kc)
+
+    def set_slot(self, email, slot):
+        kc = self.keychain()
+        kc["ccswitch"][email] = json.dumps(slot, separators=(",", ":"))
+        self.keychain(kc)
+
     def config(self, d=None):
         p = self.home / ".claude.json"
         if d is not None:
@@ -72,12 +99,24 @@ class Save(Base):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("a@x.com", self.keychain()["ccswitch"])
         slot = json.loads(self.keychain()["ccswitch"]["a@x.com"])
-        self.assertEqual(slot["credentials"], oauth("a@x.com") | {"claudeAiOauth": slot["credentials"]["claudeAiOauth"]})
+        self.assertEqual(slot["credentials"], {"claudeAiOauth": self.live()["claudeAiOauth"]},
+                         "a slot holds the login block and nothing else of the live item")
         self.assertEqual(slot["oauthAccount"]["emailAddress"], "a@x.com")
         idx = self.index()["slots"]["a@x.com"]
         self.assertEqual(idx["usage"]["five_hour"]["utilization"], 90)
         self.assertEqual(idx["plan"], "team")
         self.assertNotIn("rt-", json.dumps(self.index()), "the index must never hold a token")
+
+    def test_save_stores_only_the_login_block_never_mcp_oauth_or_any_other_key(self):
+        self.set_live(oauth("a@x.com") | {"mcpOAuth": MCP_LIVE, "futureKey": {"x": 1}})
+        before = self.live_raw()
+        p = self.cc("save")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        raw = self.keychain()["ccswitch"]["a@x.com"]
+        self.assertEqual(json.loads(raw)["credentials"], {"claudeAiOauth": self.live()["claudeAiOauth"]})
+        for needle in ("mcpOAuth", "mrt-", "mat-", "futureKey", "organizationUuid"):
+            self.assertNotIn(needle, raw, f"{needle} must not be copied into a slot")
+        self.assertEqual(self.live_raw(), before, "save never writes the live item")
 
     def test_save_refuses_a_dead_login_and_prints_the_fallback(self):
         self.keychain({LIVE: {"tester": json.dumps(oauth("a@x.com", dead=True))}})
@@ -107,13 +146,15 @@ class Switch(Base):
         self.assertEqual(p.returncode, 0, p.stderr)
         live = self.live()
         self.assertEqual(live["claudeAiOauth"]["refreshToken"], "rt-a@x.com")
-        self.assertEqual(live["organizationUuid"], "org-a@x.com")
+        self.assertEqual(live["organizationUuid"], "org-b@x.com", "every other key of the live item stays as it was")
         cfg = self.config()
         self.assertEqual(cfg["oauthAccount"]["emailAddress"], "a@x.com")
         self.assertEqual(cfg["cachedUsageUtilization"]["utilization"]["five_hour"]["utilization"], 90)
         self.assertEqual(cfg["numStartups"], 3, "other keys of .claude.json must survive")
         self.assertEqual(cfg["mcpServers"], {"m": {}})
         self.assertIn("now on a@x.com", p.stderr)
+        self.assertIn("claude.ai connectors belong to the account; local MCP servers (claude mcp add --scope user) "
+                      "keep their login across switches. Run /mcp or restart a session to reload connectors.", p.stderr)
 
     def test_switch_saves_the_outgoing_login_first_so_a_rotated_token_is_not_lost(self):
         # a session rotated b's refresh token after the slot was saved
@@ -162,7 +203,7 @@ class Switch(Base):
         p = self.cc("a")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
-        self.assertEqual(p.stderr.strip().count("\n"), 0, "one line of output")
+        self.assertEqual(p.stderr.strip().count("\n"), 1, "two lines: the switch and the connector hint, no question")
         p = self.cc("b", "--ask")
         self.assertEqual(p.returncode, 2)
         self.assertIn("not a terminal", p.stderr)
@@ -361,7 +402,7 @@ class Tee(Base):
         self.assertEqual(p.stdout.strip(), "HUD")
 
 
-class Watch(Base):
+class WatchBase(Base):
     """Three slots a, b, c; b is live. The feed says b is at 95%."""
 
     def setUp(self):
@@ -391,6 +432,8 @@ class Watch(Base):
     def state(self):
         return json.loads((self.home / "ccswitch" / "watch-state.json").read_text())
 
+
+class Watch(WatchBase):
     def test_below_the_threshold_nothing_happens(self):
         self.session("s1", "S1", five_hour=50)
         p = self.cc("watch", "--once", "--switch-at", "90", "-v")
@@ -518,3 +561,113 @@ class Watch(Base):
         self.assertIn("would switch b@x.com -> c@x.com", p.stderr)
         self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
         self.assertEqual(self.cmux_calls(), [])
+
+
+class ForeignKeys(Base):
+    """Slots a and b saved, live as b. Nothing but claudeAiOauth ever moves between a slot
+    and the live item; mcpOAuth (local MCP server logins) is the key that matters."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.cc("save").returncode, 0)   # slot a
+        self.login("b@x.com")                               # now live as b
+        self.assertEqual(self.cc("save").returncode, 0)   # slot b
+
+    def old_style_slot(self, email, extras):
+        """A slot as versions before 2026-10-22 wrote it: the whole live document under credentials."""
+        slot = json.loads(self.keychain()["ccswitch"][email])
+        slot["credentials"] = {**extras, "claudeAiOauth": slot["credentials"]["claudeAiOauth"]}
+        self.set_slot(email, slot)
+
+    def test_a_switch_keeps_the_live_mcp_oauth_byte_identical_even_when_the_slot_carries_a_stale_copy(self):
+        self.set_live(self.live() | {"mcpOAuth": MCP_LIVE})
+        self.old_style_slot("a@x.com", {"mcpOAuth": MCP_STALE, "organizationUuid": "org-a@x.com"})
+        p = self.cc("a", "-y")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        live_raw = self.live_raw()
+        self.assertIn('"mcpOAuth":' + raw(MCP_LIVE), live_raw, "the live mcpOAuth must survive byte for byte")
+        self.assertEqual(self.live()["mcpOAuth"], MCP_LIVE)
+        for needle in ("mrt-stale", "mat-stale", "linear", "mrt-gone"):
+            self.assertNotIn(needle, live_raw, "nothing from the slot's stale copy may reach the live item")
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "rt-a@x.com")
+        self.assertEqual(self.live()["organizationUuid"], "org-b@x.com")
+
+    def test_mcp_tokens_refreshed_while_on_the_other_account_are_not_rolled_back_by_a_round_trip(self):
+        v1 = {"plugin:github|9f1c": {"accessToken": "mat-1", "refreshToken": "mrt-1"}}
+        v2 = {"plugin:github|9f1c": {"accessToken": "mat-2", "refreshToken": "mrt-2"}}
+        v3 = {"plugin:github|9f1c": {"accessToken": "mat-3", "refreshToken": "mrt-3"}}
+        self.set_live(self.live() | {"mcpOAuth": v1}); self.assertEqual(self.cc("save").returncode, 0)   # b saved with v1 live
+        self.set_live(self.live() | {"mcpOAuth": v2})                                                     # the MCP server rotated
+        self.assertEqual(self.cc("a", "-y").returncode, 0)
+        self.assertEqual(self.live()["mcpOAuth"], v2)
+        self.set_live(self.live() | {"mcpOAuth": v3})                                                     # rotated again, while on a
+        self.assertEqual(self.cc("b", "-y").returncode, 0)
+        self.assertEqual(self.live()["mcpOAuth"], v3, "the live MCP login wins; a slot never carries one")
+        self.assertIn('"mcpOAuth":' + raw(v3), self.live_raw())
+        for email in ("a@x.com", "b@x.com"):
+            self.assertNotIn("mcpOAuth", self.keychain()["ccswitch"][email])
+
+    def test_an_old_slot_with_extra_keys_still_switches_and_is_rewritten_clean_on_its_next_save(self):
+        self.set_live(self.live() | {"mcpOAuth": MCP_LIVE})
+        self.old_style_slot("a@x.com", {"mcpOAuth": MCP_STALE, "organizationUuid": "org-a@x.com", "futureKey": [1, 2]})
+        self.assertEqual(self.cc("doctor").returncode, 0, "an old-style slot is not a problem")
+        p = self.cc("a", "-y")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        live = self.live()
+        self.assertEqual(live["claudeAiOauth"]["refreshToken"], "rt-a@x.com")
+        self.assertEqual(live["mcpOAuth"], MCP_LIVE)
+        self.assertIn('"mcpOAuth":' + raw(MCP_LIVE), self.live_raw())
+        self.assertNotIn("futureKey", self.live_raw())
+        self.assertEqual(self.cc("b", "-y").returncode, 0)      # saves a on the way out: the extras are dropped
+        slot_a = self.keychain()["ccswitch"]["a@x.com"]
+        self.assertEqual(json.loads(slot_a)["credentials"], {"claudeAiOauth": live["claudeAiOauth"]})
+        for needle in ("mcpOAuth", "mrt-", "futureKey", "organizationUuid"):
+            self.assertNotIn(needle, slot_a)
+        self.assertEqual(self.live()["mcpOAuth"], MCP_LIVE)
+
+    def test_creating_the_live_item_from_scratch_writes_only_the_login_block(self):
+        self.old_style_slot("a@x.com", {"mcpOAuth": MCP_STALE, "organizationUuid": "org-a@x.com"})
+        kc = self.keychain(); del kc[LIVE]; self.keychain(kc)
+        p = self.cc("a", "-y")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.live(), {"claudeAiOauth": json.loads(self.keychain()["ccswitch"]["a@x.com"])["credentials"]["claudeAiOauth"]})
+        self.assertNotIn("mcpOAuth", self.live_raw())
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "a@x.com")
+
+    def test_the_outgoing_resave_on_a_switch_stores_only_the_login_block_and_leaves_the_live_item_alone(self):
+        doc = self.live() | {"mcpOAuth": MCP_LIVE}
+        doc["claudeAiOauth"]["refreshToken"] = "rt-b@x.com-rotated"   # a session rotated b's token after the save
+        self.set_live(doc)
+        self.assertEqual(self.cc("a", "-y").returncode, 0)
+        slot_b = self.keychain()["ccswitch"]["b@x.com"]
+        self.assertEqual(json.loads(slot_b)["credentials"], {"claudeAiOauth": doc["claudeAiOauth"]})
+        self.assertNotIn("mcpOAuth", slot_b)
+        self.assertIn('"mcpOAuth":' + raw(MCP_LIVE), self.live_raw())
+
+
+class WatchForeignKeys(WatchBase):
+    def test_the_daemon_resave_after_a_token_rotation_stores_only_the_login_block_and_leaves_the_live_item_alone(self):
+        doc = self.live() | {"mcpOAuth": MCP_LIVE}
+        doc["claudeAiOauth"]["refreshToken"] = "rt-b@x.com-rotated"
+        self.set_live(doc)
+        before = self.live_raw()
+        self.session("s1", "S1", five_hour=50)                       # below the threshold: no switch, just the resave
+        p = self.cc("watch", "--once", "--switch-at", "90")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "b@x.com")
+        slot_b = self.keychain()["ccswitch"]["b@x.com"]
+        self.assertEqual(json.loads(slot_b)["credentials"], {"claudeAiOauth": doc["claudeAiOauth"]})
+        self.assertNotIn("mcpOAuth", slot_b)
+        self.assertEqual(self.live_raw(), before, "the resave never writes the live item")
+
+    def test_an_automatic_switch_keeps_the_live_mcp_oauth(self):
+        self.set_live(self.live() | {"mcpOAuth": MCP_LIVE})
+        slot = json.loads(self.keychain()["ccswitch"]["c@x.com"])     # c: an old-style slot with a stale copy
+        slot["credentials"] = {"mcpOAuth": MCP_STALE, "claudeAiOauth": slot["credentials"]["claudeAiOauth"]}
+        self.set_slot("c@x.com", slot)
+        self.session("s1", "S1", five_hour=95)
+        p = self.cc("watch", "--once", "--switch-at", "90", "--compact-via", "cmux")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.config()["oauthAccount"]["emailAddress"], "c@x.com")
+        self.assertIn('"mcpOAuth":' + raw(MCP_LIVE), self.live_raw())
+        self.assertNotIn("mrt-stale", self.live_raw())

@@ -275,6 +275,9 @@ def slot_read(email: str) -> dict | None:
         raise Fail(f"slot {email} is not JSON")
     if d.get("format") != SLOT_FORMAT or not _shape_ok(d.get("credentials")):
         raise Fail(f"slot {email} has a shape this version does not know")
+    # Slots written before 2026-10-22 hold the whole live document under "credentials"
+    # (mcpOAuth and all). They are read as they are and only their claudeAiOauth block is
+    # ever used; the next save of that account rewrites the slot with the login alone.
     return d
 
 
@@ -369,7 +372,10 @@ def do_save(as_email: str | None, quiet: bool = False) -> str:
         "format": SLOT_FORMAT,
         "email": email,
         "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "credentials": live,
+        # only the login block. Every other key of the live item (mcpOAuth: the logins of
+        # locally configured MCP servers, and anything Claude Code adds later) is never
+        # read into a slot: it belongs to the machine, not to the account.
+        "credentials": {"claudeAiOauth": live["claudeAiOauth"]},
         "oauthAccount": cfg.get("oauthAccount"),
         "cachedUsageUtilization": cfg.get("cachedUsageUtilization"),
         "status": {k: status.get(k) for k in ("orgName", "subscriptionType", "orgId") if status.get(k)},
@@ -430,9 +436,11 @@ def do_switch(name: str, assume_yes: bool, probe: bool, ask: bool = False) -> in
     if live is not None and cur and oauth_dead(live["claudeAiOauth"]) is None:
         do_save(cur, quiet=True)
 
-    # 2. the live item: only the claudeAiOauth block moves; every other key stays
+    # 2. the live item: only the claudeAiOauth block moves. Every other key of the CURRENT
+    #    live item (mcpOAuth, ...) is kept verbatim; nothing else from the slot is looked
+    #    at, so a slot written by an older version that still carries extra keys cannot
+    #    overlay a stale copy. No live item at all -> a new one with only the login.
     new_live = dict(live) if live is not None else {}
-    new_live.update({k: v for k, v in slot["credentials"].items() if k != "claudeAiOauth"})
     new_live["claudeAiOauth"] = slot["credentials"]["claudeAiOauth"]
     write_live(new_live, account)
 
@@ -458,6 +466,8 @@ def do_switch(name: str, assume_yes: bool, probe: bool, ask: bool = False) -> in
         say(fallback_line(target))
         return 3
     say(f"now on {target} (was {cur or 'nobody'}); open sessions follow within ~30s")
+    say("claude.ai connectors belong to the account; local MCP servers (claude mcp add --scope user) "
+        "keep their login across switches. Run /mcp or restart a session to reload connectors.")
 
     if probe:
         ok = do_probe()

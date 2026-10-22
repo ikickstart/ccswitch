@@ -24,12 +24,24 @@ Claude Code keeps one login per config directory, in the macOS Keychain item
 the machine. `ccswitch` does what `/login` does to that item, from a saved copy
 instead of a browser.
 
-- `ccswitch save` snapshots the live item into a Keychain slot keyed by the
-  account email, together with the account label and the usage snapshot that
-  Claude Code keeps in `~/.claude.json`.
-- `ccswitch <email>` saves the outgoing login first, then loads the chosen slot
-  into the live item and relabels `~/.claude.json`. Only the `claudeAiOauth`
-  block moves; everything else in both places stays.
+- `ccswitch save` copies the `claudeAiOauth` block of the live item into a
+  Keychain slot keyed by the account email, together with the account label
+  and the usage snapshot that Claude Code keeps in `~/.claude.json`.
+- `ccswitch <email>` saves the outgoing login first, then puts the chosen
+  slot's `claudeAiOauth` block into the live item and relabels
+  `~/.claude.json`. Only `claudeAiOauth` moves; everything else in both places
+  stays exactly as it is.
+- **What moves and what is stored: only `claudeAiOauth`.** The live item also
+  holds `mcpOAuth`, the OAuth tokens of MCP servers you added locally
+  (`claude mcp add --scope user`). ccswitch never reads, stores, copies or
+  rewrites that key, or any other key beside `claudeAiOauth`: a switch
+  rewrites the live item with its current contents and a new `claudeAiOauth`
+  block, and a slot holds no MCP token at all. So local MCP servers keep their
+  login across a switch, while claude.ai connectors (the ones tied to the
+  account on claude.ai) follow the account; run `/mcp` or start a new session
+  to reload them. Slots written by versions before 2026-10-22 still carry a
+  copy of the whole item; they switch fine (only their `claudeAiOauth` is
+  used) and are rewritten clean on their next save.
 - Slots are Keychain items under the service `ccswitch`, written through
   `security -i` so a token never appears in `ps`. The index at
   `~/.config/ccswitch/slots.json` holds emails, plan, org, save time and the

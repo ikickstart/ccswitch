@@ -4,6 +4,25 @@ Why this exists: the claude.ai connectors (Slack, Atlassian, Drive, ...) are aut
 
 Endpoints and flags below came from web search (2026-10-22) and are marked **verify** where the sources disagreed or were third-party. Check the vendor docs before relying on them. Never put a token in `~/.claude.json` or a committed `.mcp.json`.
 
+## How to use ccswitch with MCP (no re-auth)
+
+What ccswitch does and does not do for MCP:
+
+- It moves **only the Claude login** (`claudeAiOauth`) between your accounts. It never reads, stores, copies or overwrites `mcpOAuth`, the part of the same Keychain item where Claude Code keeps the sign-in of local MCP servers. A switch leaves that exactly as it is.
+- Because of that, a **local** MCP server (added with `claude mcp add --scope user ...`) keeps working after a switch with no sign-in prompt. Its login is to Slack / Atlassian / Salesforce, not to Claude.
+- The **claude.ai connectors** are the exception: Anthropic ties them to each account, so ccswitch cannot carry them over. That is why the sections below move Slack, Jira and Salesforce to local servers.
+
+Day-to-day commands (`ccswitch <target>` is the same as `ccswitch switch <target>`; a bare `ccswitch` lists the slots):
+
+- `ccswitch list`: the saved accounts with their last known usage. `ccswitch status`: who is logged in now.
+- `ccswitch switch me` (or `wp`, `sw`, `sde`, an email, a unique prefix, a number from `list`, or `next`): switch the login. Open sessions follow within about 30 seconds. Your local MCP servers stay connected and need no sign-in.
+- After a switch, the claude.ai connectors still belong to the old account's side. Run `/mcp` or start a new session to reload connectors. Local MCP servers need nothing.
+- `ccswitch save`: snapshot the current login into its slot (it keeps the refresh token fresh; a switch does this for the outgoing account automatically).
+- Adding or re-logging an account: `claude auth login --email <addr> && ccswitch save` (or `ccswitch login`, which runs the same login and saves it). Never `/logout`.
+- `ccswitch alias <name> <email>`: name a slot. `ccswitch doctor`: check the Keychain items, the index and every slot.
+
+Do once, then forget: authenticate each local MCP server one time with `/mcp` (sections 1 to 3). After that, `ccswitch <account>` is all you run when you change account; MCP needs no step.
+
 ## 0. Prerequisites (once)
 
 - [x] ccswitch fix landed (`ecdcb08`, 2026-10-22): a switch moves only `claudeAiOauth` and never reads, copies or overwrites `mcpOAuth`; a save stores only the login block. 47 unit tests pass against the fake Keychain (8 new, shown failing on the old code).

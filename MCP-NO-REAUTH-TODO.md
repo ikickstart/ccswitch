@@ -6,12 +6,23 @@ Endpoints and flags below came from web search (2026-10-22) and are marked **ver
 
 ## How to use it
 
-1. Add each MCP server as a local one, once (steps in sections 1 to 3 below), and sign in to it once with `/mcp`.
-2. Switch account whenever you like: `ccswitch me` (or `wp`, `sw`, `sde`, or `next`).
-3. Your MCP servers keep working. Nothing to sign in to again.
+1. Add each MCP server as a local one, once, and sign in to it once (URLs and flags per server are in sections 1 to 3 below):
+   ```
+   claude mcp add slack --transport http --scope user https://mcp.slack.com/mcp
+   ```
+   then, inside a Claude Code session, run `/mcp`, pick the server and sign in.
+2. Switch account whenever you like:
+   ```
+   ccswitch me        # or: wp, sw, sde, next
+   ```
+3. Your MCP servers keep working. Check with `/mcp` (it should show them connected, no sign-in).
 
-Other commands: `ccswitch` (list accounts), `ccswitch status` (who is logged in).
-Add or re-login an account: `claude auth login --email <addr> && ccswitch save`.
+Other commands:
+```
+ccswitch                                         # list accounts
+ccswitch status                                  # who is logged in
+claude auth login --email <addr> && ccswitch save   # add or re-login an account
+```
 
 ## 0. Prerequisites (once)
 

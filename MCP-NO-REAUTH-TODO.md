@@ -4,9 +4,22 @@ Why this exists: the claude.ai connectors (Slack, Atlassian, Drive, ...) are aut
 
 Endpoints and flags below came from web search (2026-10-22) and are marked **verify** where the sources disagreed or were third-party. Check the vendor docs before relying on them. Never put a token in `~/.claude.json` or a committed `.mcp.json`.
 
+## Status as of 2026-10-22 (what is proven and what is not)
+
+**Proven (by tests):** `ccswitch switch` and `ccswitch save` never touch `mcpOAuth` or any other foreign key of the Keychain item `Claude Code-credentials`. Before `ecdcb08` a switch overlaid the slot's stale copy of those keys onto the live item.
+
+**Established by reading the Claude Code bundle (not by a live run):**
+- Local MCP OAuth tokens are read as `readAsync()?.mcpOAuth`, from the SAME Keychain item as `claudeAiOauth`, keyed by server (name plus config), **not by account**. One sign-in per server is therefore shared by all four accounts.
+- Every Claude Code write of the login (token refresh, sign-in, dead-token clearing) is a read-modify-write that spreads the existing object first (`{...existing, claudeAiOauth: ...}`), so `claude auth login --email <addr>` should leave `mcpOAuth` alone.
+
+**Still unproven (needs your browser, check names only, never print values):**
+1. Whether a **user-scope** server's token is stored once or per project (see Prerequisites).
+2. That `mcpOAuth` actually survives a real switch and a real `claude auth login` on this machine (the check in section 5).
+3. The endpoints and flags marked **verify** below.
+
 ## 0. Prerequisites (once)
 
-- [ ] ccswitch fix landed: a switch moves only `claudeAiOauth` and never reads, copies or overwrites `mcpOAuth` (agent `acf680ab…`, commit in this repo).
+- [x] ccswitch fix landed (`ecdcb08`, 2026-10-22): a switch moves only `claudeAiOauth` and never reads, copies or overwrites `mcpOAuth`; a save stores only the login block. 47 unit tests pass against the fake Keychain (8 new, shown failing on the old code).
 - [ ] Test whether a **user-scope** server's OAuth token is shared across projects or stored per project (GitHub issue "Share MCP OAuth tokens globally for user-scoped servers"). Authenticate Slack in project A, open project B, run `/mcp`. If it asks again, prefer the token-based or tool-held-login routes below (Jira API token, Salesforce `sf` login, `mcp-remote`).
 - [ ] In claude.ai Settings -> Connectors, turn off the claude.ai copies of Slack / Atlassian / Salesforce on every account, so the same tool does not appear twice.
 - [ ] Remove stale entries from `~/.claude/mcp-needs-auth-cache.json` (today it lists "claude.ai Google Cloud BigQuery").
@@ -44,7 +57,8 @@ Endpoints and flags below came from web search (2026-10-22) and are marked **ver
 ## 5. Final check (after all of the above)
 
 - [ ] `ccswitch switch` through all four accounts in turn; in a fresh session each time, `/mcp` shows Slack / Jira / Salesforce connected with no auth prompt.
-- [ ] `security find-generic-password -s "Claude Code-credentials"` still has the `mcpOAuth` key after the switches (names only; never print values).
+- [ ] The key NAMES of the Keychain item still include `mcpOAuth` after the switches (check names only; never print values): `python3 - <<'PY'\nimport subprocess,json,getpass\nd=json.loads(subprocess.run(['security','find-generic-password','-s','Claude Code-credentials','-a',getpass.getuser(),'-w'],capture_output=True,text=True).stdout)\nprint(sorted(d.keys()))\nPY`
+- [ ] After ONE real `! claude auth login --email <addr> && ccswitch save` (re-login), run the same name check: `mcpOAuth` should still be listed. If it is gone, that is Claude Code behaviour, not ccswitch; add a re-inject step to ccswitch (back up the key names/values to a private file first).
 - [ ] If anything re-prompts, record which server and whether it was after a switch or a new project, then pick the next route in that section.
 
 Sources: [Zuplo: Claude Code and /mcp OAuth](https://zuplo.com/docs/mcp-gateway/connect-clients/claude-code.md), [Slack MCP listing](https://mcpservers.org/remote-mcp-servers/slack), [Atlassian Rovo MCP](https://www.atlassian.com/platform/rovo-mcp), [Salesforce hosted MCP blog](https://developer.salesforce.com/blogs/2026/05/connect-claude-with-salesforce-hosted-mcp-servers), [BigQuery MCP reference](https://docs.cloud.google.com/bigquery/docs/reference/mcp), [per-project token issue](https://claudeissues.com/issue/37776-feature-share-mcp-oauth-tokens-globally-for-user-scoped-servers-instead-of-per-p).

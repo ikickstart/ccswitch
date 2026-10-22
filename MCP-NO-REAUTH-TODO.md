@@ -4,19 +4,6 @@ Why this exists: the claude.ai connectors (Slack, Atlassian, Drive, ...) are aut
 
 Endpoints and flags below came from web search (2026-10-22) and are marked **verify** where the sources disagreed or were third-party. Check the vendor docs before relying on them. Never put a token in `~/.claude.json` or a committed `.mcp.json`.
 
-## Status as of 2026-10-22 (what is proven and what is not)
-
-**Proven (by tests):** `ccswitch switch` and `ccswitch save` never touch `mcpOAuth` or any other foreign key of the Keychain item `Claude Code-credentials`. Before `ecdcb08` a switch overlaid the slot's stale copy of those keys onto the live item.
-
-**Established by reading the Claude Code bundle (not by a live run):**
-- Local MCP OAuth tokens are read as `readAsync()?.mcpOAuth`, from the SAME Keychain item as `claudeAiOauth`, keyed by server (name plus config), **not by account**. One sign-in per server is therefore shared by all four accounts.
-- Every Claude Code write of the login (token refresh, sign-in, dead-token clearing) is a read-modify-write that spreads the existing object first (`{...existing, claudeAiOauth: ...}`), so `claude auth login --email <addr>` should leave `mcpOAuth` alone.
-
-**Still unproven (needs your browser, check names only, never print values):**
-1. Whether a **user-scope** server's token is stored once or per project (see Prerequisites).
-2. That `mcpOAuth` actually survives a real switch and a real `claude auth login` on this machine (the check in section 5).
-3. The endpoints and flags marked **verify** below.
-
 ## 0. Prerequisites (once)
 
 - [x] ccswitch fix landed (`ecdcb08`, 2026-10-22): a switch moves only `claudeAiOauth` and never reads, copies or overwrites `mcpOAuth`; a save stores only the login block. 47 unit tests pass against the fake Keychain (8 new, shown failing on the old code).
